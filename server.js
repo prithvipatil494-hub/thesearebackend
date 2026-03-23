@@ -51,7 +51,9 @@ mongoose.connect(MONGODB_URI, {
 .then(() => console.log('✅ MongoDB Connected'))
 .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
-// Mongoose Schemas
+// ==================== MONGOOSE SCHEMAS ====================
+
+// Location Schema
 const locationSchema = new mongoose.Schema({
   trackId: { type: String, required: true, unique: true, index: true },
   lat: { type: Number, required: true },
@@ -79,8 +81,29 @@ pathHistorySchema.pre('save', function(next) {
   next();
 });
 
+// Message Schema
+const messageSchema = new mongoose.Schema({
+  conversationId: String,
+  senderId: String,
+  senderName: String,
+  text: String,
+  timestamp: { type: Number, default: () => Date.now() }
+});
+
+// Conversation Schema
+const conversationSchema = new mongoose.Schema({
+  conversationId: { type: String, unique: true },
+  participants: [String],
+  names: { type: Map, of: String },
+  lastMessage: String,
+  lastTimestamp: Number,
+  unread: { type: Map, of: Number, default: {} }
+});
+
 const Location = mongoose.model('Location', locationSchema);
 const PathHistory = mongoose.model('PathHistory', pathHistorySchema);
+const Message = mongoose.model('Message', messageSchema);
+const Conversation = mongoose.model('Conversation', conversationSchema);
 
 // ==================== REST API ROUTES ====================
 
@@ -96,7 +119,11 @@ app.get('/', (req, res) => {
       updateLocation: 'POST /api/location/update',
       getLocation: 'GET /api/location/:trackId',
       getPath: 'GET /api/path/:trackId',
-      deactivate: 'POST /api/location/deactivate/:trackId'
+      deactivate: 'POST /api/location/deactivate/:trackId',
+      sendMessage: 'POST /api/chat/send',
+      getConversations: 'GET /api/chat/conversations/:trackId',
+      getMessages: 'GET /api/chat/messages/:conversationId',
+      markRead: 'POST /api/chat/read'
     }
   });
 });
@@ -334,6 +361,130 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+// ==================== CHAT API ROUTES ====================
+
+// Send a message
+app.post('/api/chat/send', async (req, res) => {
+  try {
+    const { conversationId, senderId, senderName, receiverId, receiverName, text } = req.body;
+
+    if (!conversationId || !senderId || !receiverId || !text) {
+      return res.status(400).json({ error: 'Missing required fields: conversationId, senderId, receiverId, text' });
+    }
+
+    const ts = Date.now();
+
+    await Message.create({ conversationId, senderId, senderName, text, timestamp: ts });
+
+    await Conversation.findOneAndUpdate(
+      { conversationId },
+      {
+        $set: {
+          conversationId,
+          lastMessage: text,
+          lastTimestamp: ts,
+          [`names.${senderId}`]: senderName,
+          [`names.${receiverId}`]: receiverName,
+        },
+        $addToSet: { participants: { $each: [senderId, receiverId] } },
+        $inc: { [`unread.${receiverId}`]: 1 },
+      },
+      { upsert: true, new: true }
+    );
+
+    // Emit real-time message via Socket.IO to conversation room
+    io.to(`conversation:${conversationId}`).emit('chat:message', {
+      conversationId,
+      senderId,
+      senderName,
+      text,
+      timestamp: ts
+    });
+
+    // Also notify receiver directly if they're online
+    io.to(`user:${receiverId}`).emit('chat:newMessage', {
+      conversationId,
+      senderId,
+      senderName,
+      text,
+      timestamp: ts
+    });
+
+    console.log(`💬 Message sent in conversation ${conversationId} by ${senderId}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error sending message:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all conversations for a trackId
+app.get('/api/chat/conversations/:trackId', async (req, res) => {
+  try {
+    const { trackId } = req.params;
+
+    if (!trackId) {
+      return res.status(400).json({ error: 'Track ID is required' });
+    }
+
+    const convos = await Conversation.find({ participants: trackId }).sort({ lastTimestamp: -1 });
+
+    res.json(convos.map(c => ({
+      conversationId: c.conversationId,
+      participants: c.participants,
+      names: Object.fromEntries(c.names || []),
+      lastMessage: c.lastMessage,
+      lastTimestamp: c.lastTimestamp,
+      unread: Object.fromEntries(c.unread || [])
+    })));
+  } catch (error) {
+    console.error('Error fetching conversations:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get messages for a conversation
+app.get('/api/chat/messages/:conversationId', async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+
+    if (!conversationId) {
+      return res.status(400).json({ error: 'Conversation ID is required' });
+    }
+
+    const msgs = await Message.find({ conversationId })
+      .sort({ timestamp: 1 })
+      .limit(200);
+
+    res.json(msgs);
+  } catch (error) {
+    console.error('Error fetching messages:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark conversation as read for a trackId
+app.post('/api/chat/read', async (req, res) => {
+  try {
+    const { conversationId, trackId } = req.body;
+
+    if (!conversationId || !trackId) {
+      return res.status(400).json({ error: 'Missing required fields: conversationId, trackId' });
+    }
+
+    await Conversation.findOneAndUpdate(
+      { conversationId },
+      { $set: { [`unread.${trackId}`]: 0 } }
+    );
+
+    console.log(`✅ Marked conversation ${conversationId} as read for ${trackId}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error marking as read:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== SOCKET.IO REAL-TIME ====================
 
 io.on('connection', (socket) => {
@@ -343,8 +494,6 @@ io.on('connection', (socket) => {
   socket.on('track:subscribe', (trackId) => {
     console.log(`📍 Client ${socket.id} subscribed to track ${trackId}`);
     socket.join(`track:${trackId}`);
-    
-    // Send acknowledgment
     socket.emit('track:subscribed', { trackId, success: true });
   });
   
@@ -352,9 +501,27 @@ io.on('connection', (socket) => {
   socket.on('track:unsubscribe', (trackId) => {
     console.log(`📍 Client ${socket.id} unsubscribed from track ${trackId}`);
     socket.leave(`track:${trackId}`);
-    
-    // Send acknowledgment
     socket.emit('track:unsubscribed', { trackId, success: true });
+  });
+
+  // Join a user's personal room (for chat notifications)
+  socket.on('user:join', (trackId) => {
+    console.log(`👤 Client ${socket.id} joined user room: ${trackId}`);
+    socket.join(`user:${trackId}`);
+    socket.emit('user:joined', { trackId, success: true });
+  });
+
+  // Join a specific conversation room
+  socket.on('conversation:join', (conversationId) => {
+    console.log(`💬 Client ${socket.id} joined conversation: ${conversationId}`);
+    socket.join(`conversation:${conversationId}`);
+    socket.emit('conversation:joined', { conversationId, success: true });
+  });
+
+  // Leave a conversation room
+  socket.on('conversation:leave', (conversationId) => {
+    console.log(`💬 Client ${socket.id} left conversation: ${conversationId}`);
+    socket.leave(`conversation:${conversationId}`);
   });
   
   // Real-time location update via Socket.IO
@@ -362,7 +529,6 @@ io.on('connection', (socket) => {
     try {
       const { trackId, lat, lng, speed, accuracy } = data;
       
-      // Validate data
       if (!trackId || lat === undefined || lng === undefined) {
         socket.emit('error', { message: 'Missing required fields' });
         return;
@@ -373,8 +539,7 @@ io.on('connection', (socket) => {
         return;
       }
       
-      // Update database
-      const location = await Location.findOneAndUpdate(
+      await Location.findOneAndUpdate(
         { trackId },
         {
           lat,
@@ -387,7 +552,6 @@ io.on('connection', (socket) => {
         { upsert: true, new: true }
       );
       
-      // Update path history
       await PathHistory.findOneAndUpdate(
         { trackId },
         {
@@ -411,13 +575,8 @@ io.on('connection', (socket) => {
         timestamp: new Date()
       };
       
-      // Broadcast to all clients (for general updates)
       io.emit('location:updated', updateData);
-      
-      // Broadcast to specific room subscribers
       io.to(`track:${trackId}`).emit('location:updated', updateData);
-      
-      // Legacy support - emit with track ID in event name
       io.emit(`location:${trackId}`, updateData);
       
       console.log(`📍 Real-time location updated for ${trackId} via Socket.IO`);
@@ -444,7 +603,6 @@ io.on('connection', (socket) => {
 
 // ==================== AUTOMATIC CLEANUP JOB ====================
 
-// Automatic cleanup job (runs every hour)
 setInterval(async () => {
   try {
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
