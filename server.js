@@ -11,9 +11,6 @@ const app    = express();
 const server = http.createServer(app);
 
 // ─── Redis ────────────────────────────────────────────────────────────────────
-// Install:  npm install ioredis
-// Locations are cached with a 30-second TTL — fast reads, auto-expires stale data.
-
 const redis = new Redis(
   "redis://default:4rgHpsmaNQ2qIXA8ktlxeoX2UFNdFXKQ@redis-16268.crce292.ap-south-1-2.ec2.cloud.redislabs.com:16268",
   {
@@ -26,19 +23,18 @@ const redis = new Redis(
 redis.on("connect", () => console.log("✅ Redis connected"));
 redis.on("error",   (e) => console.error("❌ Redis error:", e.message));
 
-const REDIS_TTL = 30;  // seconds — location expires after 30 s → isRecent = false on client
+const REDIS_TTL = 30;
 
-/** Write location to Redis with TTL */
 async function cacheLocation(trackId, data) {
   const key     = `loc:${trackId}`;
   const payload = JSON.stringify({ ...data, ts: Date.now() });
   await redis.setex(key, REDIS_TTL, payload);
 }
 
-/** Write a targeted location (only readable by a specific recipient) */
+// FIX BUG 2 (part 1): store recipientId in targeted cache so DB fallback works
 async function cacheLocationTargeted(trackId, recipientId, data) {
   const key     = `loc:${trackId}:for:${recipientId}`;
-  const payload = JSON.stringify({ ...data, ts: Date.now() });
+  const payload = JSON.stringify({ ...data, recipientId, ts: Date.now() });
   await redis.setex(key, REDIS_TTL, payload);
 }
 
@@ -82,28 +78,7 @@ mongoose.connect(MONGODB_URI, {
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
 // ─── SCHEMAS ──────────────────────────────────────────────────────────────────
-//
-// KEY DESIGN DECISION
-// ───────────────────
-// UserRegistry  → PERMANENT. One document per Firebase user. NEVER deleted.
-//                 Stores the stable Track ID. This is the source of truth.
-//
-// Location      → EPHEMERAL. One document per trackId. Updated in-place on
-//                 every location push. Cleaned up if stale (>24h). The Track
-//                 ID itself lives in UserRegistry, NOT here, so cleanup never
-//                 destroys the user's identity.
-//
-// PathHistory   → EPHEMERAL. Rolling 1 000-point buffer, cleaned after 24 h.
-//
-// Message /
-// Conversation  → PERSISTENT. Never cleaned up automatically.
-// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * UserRegistry — permanent record that maps Firebase UID ↔ Track ID.
- * This collection is NEVER subject to cleanup.  Even if the user hasn't
- * opened the app for months, their Track ID is safe here.
- */
 const userRegistrySchema = new mongoose.Schema({
   uid:         { type: String, required: true, unique: true, index: true },
   trackId:     { type: String, required: true, unique: true, index: true },
@@ -112,33 +87,30 @@ const userRegistrySchema = new mongoose.Schema({
   friends:     { type: [String], default: [] },
   createdAt:   { type: Date, default: Date.now },
   updatedAt:   { type: Date, default: Date.now },
-}, { collection: 'user_registry' });  // explicit collection name — never confused with others
+}, { collection: 'user_registry' });
 
 userRegistrySchema.pre('save', function (next) {
   this.updatedAt = new Date();
   next();
 });
 
-/**
- * Location — current position for a Track ID.
- * Cleaned up if not updated for 48 h, but the UserRegistry entry is untouched,
- * so the Track ID is still valid the moment the user reopens the app and pushes
- * a new location.
- */
+// FIX BUG 2 (part 2): added recipientId field so targeted locations can be
+// stored and queried separately from broadcast locations in MongoDB fallback
 const locationSchema = new mongoose.Schema({
-  trackId:   { type: String, required: true, unique: true, index: true },
-  uid:       { type: String, index: true },
-  lat:       { type: Number, required: true },
-  lng:       { type: Number, required: true },
-  speed:     { type: Number, default: 0 },
-  accuracy:  { type: Number, default: 0 },
-  timestamp: { type: Date,   default: Date.now, index: true },
-  isActive:  { type: Boolean, default: true },
+  trackId:     { type: String, required: true, index: true },
+  recipientId: { type: String, default: null, index: true }, // null = broadcast
+  uid:         { type: String, index: true },
+  lat:         { type: Number, required: true },
+  lng:         { type: Number, required: true },
+  speed:       { type: Number, default: 0 },
+  accuracy:    { type: Number, default: 0 },
+  timestamp:   { type: Date,   default: Date.now, index: true },
+  isActive:    { type: Boolean, default: true },
 }, { collection: 'locations' });
 
-/**
- * PathHistory — rolling buffer of GPS breadcrumbs.
- */
+// Compound unique index: one record per (trackId, recipientId) pair
+locationSchema.index({ trackId: 1, recipientId: 1 }, { unique: true });
+
 const pathHistorySchema = new mongoose.Schema({
   trackId:     { type: String, required: true, index: true },
   points:      [{ lat: Number, lng: Number, timestamp: Date }],
@@ -151,9 +123,6 @@ pathHistorySchema.pre('save', function (next) {
   next();
 });
 
-/**
- * Message / Conversation — chat; never auto-deleted.
- */
 const messageSchema = new mongoose.Schema({
   conversationId: { type: String, index: true },
   senderId:       String,
@@ -180,7 +149,6 @@ const Conversation = mongoose.model('Conversation', conversationSchema);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Generate a Track ID that doesn't collide with any existing one. */
 async function generateUniqueTrackId() {
   let trackId;
   let collision = true;
@@ -198,12 +166,6 @@ app.get('/', (req, res) => {
     message:   '✅ LiveLoc Backend v2 — Persistent Track IDs + Redis Cache',
     status:    'online',
     timestamp: new Date().toISOString(),
-    design: {
-      userRegistry: 'PERMANENT — track IDs never deleted',
-      locations:    'Ephemeral — Redis (30s TTL) + MongoDB fallback (cleaned after 48 h)',
-      pathHistory:  'Rolling 24 h buffer',
-      chat:         'Persistent — never deleted',
-    },
     endpoints: {
       health:               'GET  /api/health',
       ensureTrackId:        'POST /api/track/ensure',
@@ -232,16 +194,6 @@ app.get('/api/health', (req, res) => {
 });
 
 // ── /api/track/ensure ─────────────────────────────────────────────────────────
-//
-// GET-or-CREATE a Track ID for a Firebase UID.
-//
-// Guarantees:
-//   • Calling this N times with the same uid ALWAYS returns the same trackId.
-//   • The trackId is stored in UserRegistry — it survives all cleanup jobs.
-//   • Concurrent first-install calls are handled safely via the unique index
-//     on UserRegistry.uid — a duplicate-key error means the race was won by
-//     another request; we just fetch and return the winner's document.
-// ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/track/ensure', async (req, res) => {
   try {
     const { uid, displayName = '', email = '' } = req.body;
@@ -250,10 +202,8 @@ app.post('/api/track/ensure', async (req, res) => {
       return res.status(400).json({ error: 'Missing required field: uid' });
     }
 
-    // ── 1. Return existing record if found ────────────────────────────────────
     const existing = await UserRegistry.findOne({ uid });
     if (existing) {
-      // Keep displayName / email fresh on every call
       if (displayName || email) {
         await UserRegistry.updateOne(
           { uid },
@@ -264,17 +214,13 @@ app.post('/api/track/ensure', async (req, res) => {
       return res.json({ trackId: existing.trackId, reused: true });
     }
 
-    // ── 2. Generate a new unique Track ID ─────────────────────────────────────
     const trackId = await generateUniqueTrackId();
 
-    // ── 3. Insert — handle the rare case where a concurrent request beat us ──
     try {
       await UserRegistry.create({ uid, trackId, displayName, email });
       console.log(`📍 [ensure] Created new trackId for uid=${uid}: ${trackId}`);
       return res.json({ trackId, reused: false });
     } catch (dupErr) {
-      // Duplicate-key error on `uid` → a concurrent request won the race.
-      // Re-fetch and return the winner's document.
       if (dupErr.code === 11000) {
         const winner = await UserRegistry.findOne({ uid });
         if (winner) {
@@ -282,7 +228,7 @@ app.post('/api/track/ensure', async (req, res) => {
           return res.json({ trackId: winner.trackId, reused: true });
         }
       }
-      throw dupErr;  // unexpected error — let the global handler catch it
+      throw dupErr;
     }
   } catch (error) {
     console.error('Error in /api/track/ensure:', error);
@@ -290,7 +236,7 @@ app.post('/api/track/ensure', async (req, res) => {
   }
 });
 
-// ── /api/track/generate  (legacy — kept for backward compat) ─────────────────
+// ── /api/track/generate  (legacy) ────────────────────────────────────────────
 app.post('/api/track/generate', async (req, res) => {
   try {
     const trackId = await generateUniqueTrackId();
@@ -302,7 +248,7 @@ app.post('/api/track/generate', async (req, res) => {
   }
 });
 
-// ── /api/location/update  (broadcast — visible to everyone) ──────────────────
+// ── /api/location/update  (broadcast) ────────────────────────────────────────
 app.post('/api/location/update', async (req, res) => {
   try {
     const { trackId, uid, lat, lng, speed = 0, accuracy = 0 } = req.body;
@@ -316,24 +262,22 @@ app.post('/api/location/update', async (req, res) => {
 
     const data = { trackId, uid, lat, lng, accuracy, speed };
 
-    // 1. Write to Redis immediately (sub-millisecond read for pollers)
     await cacheLocation(trackId, data);
 
-    // 2. Persist to MongoDB in the background (don't await — no latency hit)
     const updateFields = {
       lat, lng, speed, accuracy,
       timestamp: new Date(),
       isActive:  true,
+      recipientId: null, // broadcast — no specific recipient
       ...(uid ? { uid } : {}),
     };
 
     Location.findOneAndUpdate(
-      { trackId },
+      { trackId, recipientId: null },
       updateFields,
       { upsert: true, new: true }
     ).catch(e => console.error('DB write error:', e.message));
 
-    // 3. Append to path history in the background
     PathHistory.findOneAndUpdate(
       { trackId },
       {
@@ -360,19 +304,39 @@ app.post('/api/location/update', async (req, res) => {
   }
 });
 
-// ── /api/location/update-targeted  (only the named recipient can read) ────────
-// Stores under a compound key  loc:<senderTrackId>:for:<recipientTrackId>
-// The recipient polls GET /api/location/:trackId?viewer=<theirTrackId>
-router.post('/api/location/update-targeted', async (req, res) => {
+// ── /api/location/update-targeted ────────────────────────────────────────────
+// FIX BUG 1: was `router.post(...)` which is undefined — changed to `app.post`
+// FIX BUG 2: now also persists to MongoDB with recipientId so DB fallback works
+app.post('/api/location/update-targeted', async (req, res) => {
   try {
     const { trackId, uid, lat, lng, accuracy = 0, speed = 0, recipientId } = req.body;
-    if (!trackId || !recipientId || lat == null || lng == null)
-      return res.status(400).json({ error: 'Missing fields' });
+
+    if (!trackId || !recipientId || lat == null || lng == null) {
+      return res.status(400).json({ error: 'Missing fields: trackId, recipientId, lat, lng' });
+    }
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'Invalid coordinates' });
+    }
 
     const data = { trackId, uid, lat, lng, accuracy, speed };
 
-    // Store under targeted key — only the recipient can read this
+    // 1. Write to Redis under targeted key
     await cacheLocationTargeted(trackId, recipientId, data);
+
+    // 2. Also persist to MongoDB with recipientId so it survives the 30s TTL
+    const updateFields = {
+      lat, lng, speed, accuracy,
+      timestamp: new Date(),
+      isActive:  true,
+      recipientId,
+      ...(uid ? { uid } : {}),
+    };
+
+    Location.findOneAndUpdate(
+      { trackId, recipientId },
+      updateFields,
+      { upsert: true, new: true }
+    ).catch(e => console.error('DB targeted write error:', e.message));
 
     res.json({ ok: true });
   } catch (e) {
@@ -381,23 +345,23 @@ router.post('/api/location/update-targeted', async (req, res) => {
   }
 });
 
-// ── /api/location/:trackId  (Redis-first, MongoDB fallback) ───────────────────
-//
-// Pass ?viewer=<callerTrackId> to also check targeted keys.
+// ── /api/location/:trackId ────────────────────────────────────────────────────
+// FIX BUG 2 (part 3): MongoDB fallback now also checks the targeted key when
+// a viewer param is present, so targeted locations survive after Redis TTL.
 //
 // Priority:
-//   1. Targeted key  loc:<trackId>:for:<viewerTrackId>   (if viewer provided)
-//   2. Broadcast key loc:<trackId>
-//   3. MongoDB fallback (for locations older than Redis TTL)
-// ─────────────────────────────────────────────────────────────────────────────
+//   1. Redis targeted key  loc:<trackId>:for:<viewerId>   (if viewer provided)
+//   2. Redis broadcast key loc:<trackId>
+//   3. MongoDB targeted    (trackId + recipientId=viewerId)
+//   4. MongoDB broadcast   (trackId + recipientId=null)
 app.get('/api/location/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
-    const viewerId    = req.query.viewer;  // optional
+    const viewerId    = req.query.viewer;
 
     if (!trackId) return res.status(400).json({ error: 'Track ID is required' });
 
-    // ── 1. Try Redis (targeted key first, then broadcast) ─────────────────────
+    // ── 1 & 2: Redis ──────────────────────────────────────────────────────────
     let raw = null;
 
     if (viewerId) {
@@ -417,16 +381,24 @@ app.get('/api/location/:trackId', async (req, res) => {
       });
     }
 
-    // ── 2. Redis miss — verify the track ID exists in the registry ────────────
+    // ── Verify track ID exists ─────────────────────────────────────────────────
     const registered = await UserRegistry.findOne({ trackId });
     if (!registered) {
       return res.status(404).json({ error: 'Track ID not found' });
     }
 
-    // ── 3. MongoDB fallback (stale / historical data) ─────────────────────────
-    const location = await Location.findOne({ trackId });
+    // ── 3: MongoDB targeted fallback ──────────────────────────────────────────
+    if (viewerId) {
+      const targeted = await Location.findOne({ trackId, recipientId: viewerId });
+      if (targeted) {
+        const isRecent = targeted.timestamp > new Date(Date.now() - 30_000);
+        return res.json({ ...targeted.toObject(), isRecent, hasLocation: true });
+      }
+    }
+
+    // ── 4: MongoDB broadcast fallback ─────────────────────────────────────────
+    const location = await Location.findOne({ trackId, recipientId: null });
     if (!location) {
-      // Registered but no location pushed yet (or cleaned up).
       return res.json({
         trackId,
         lat:         null,
@@ -470,10 +442,8 @@ app.post('/api/location/deactivate/:trackId', async (req, res) => {
     const { trackId } = req.params;
     if (!trackId) return res.status(400).json({ error: 'Track ID is required' });
 
-    // Remove from Redis immediately
     await redis.del(`loc:${trackId}`);
-
-    await Location.findOneAndUpdate({ trackId }, { isActive: false });
+    await Location.updateMany({ trackId }, { isActive: false });
     console.log(`📍 Location deactivated for ${trackId}`);
     res.json({ success: true });
   } catch (error) {
@@ -508,7 +478,7 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-// ── Manual cleanup (only Location + PathHistory — never UserRegistry) ─────────
+// ── Manual cleanup ────────────────────────────────────────────────────────────
 app.post('/api/cleanup', async (req, res) => {
   try {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -521,7 +491,7 @@ app.post('/api/cleanup', async (req, res) => {
       success: true,
       deletedLocations: dl.deletedCount,
       deletedPaths:     dp.deletedCount,
-      note: 'UserRegistry (track IDs) was NOT touched. Redis keys expire automatically.',
+      note: 'UserRegistry (track IDs) was NOT touched.',
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -620,10 +590,10 @@ app.post('/api/chat/read', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('👤 Connected:', socket.id);
 
-  socket.on('track:subscribe',   (id) => { socket.join(`track:${id}`);        socket.emit('track:subscribed',      { trackId: id,        success: true }); });
-  socket.on('track:unsubscribe', (id) => { socket.leave(`track:${id}`);       socket.emit('track:unsubscribed',    { trackId: id,        success: true }); });
-  socket.on('user:join',         (id) => { socket.join(`user:${id}`);         socket.emit('user:joined',           { trackId: id,        success: true }); });
-  socket.on('conversation:join', (id) => { socket.join(`conversation:${id}`); socket.emit('conversation:joined',   { conversationId: id, success: true }); });
+  socket.on('track:subscribe',   (id) => { socket.join(`track:${id}`);        socket.emit('track:subscribed',    { trackId: id,        success: true }); });
+  socket.on('track:unsubscribe', (id) => { socket.leave(`track:${id}`);       socket.emit('track:unsubscribed',  { trackId: id,        success: true }); });
+  socket.on('user:join',         (id) => { socket.join(`user:${id}`);         socket.emit('user:joined',         { trackId: id,        success: true }); });
+  socket.on('conversation:join', (id) => { socket.join(`conversation:${id}`); socket.emit('conversation:joined', { conversationId: id, success: true }); });
   socket.on('conversation:leave',(id) => { socket.leave(`conversation:${id}`); });
 
   socket.on('location:update', async (data) => {
@@ -636,12 +606,10 @@ io.on('connection', (socket) => {
         socket.emit('error', { message: 'Invalid coordinates' }); return;
       }
 
-      // Write to Redis first
       await cacheLocation(trackId, { trackId, uid, lat, lng, speed, accuracy });
 
-      // Persist to MongoDB in the background
-      const fields = { lat, lng, speed, accuracy, timestamp: new Date(), isActive: true, ...(uid ? { uid } : {}) };
-      Location.findOneAndUpdate({ trackId }, fields, { upsert: true })
+      const fields = { lat, lng, speed, accuracy, timestamp: new Date(), isActive: true, recipientId: null, ...(uid ? { uid } : {}) };
+      Location.findOneAndUpdate({ trackId, recipientId: null }, fields, { upsert: true })
         .catch(e => console.error('Socket DB write error:', e.message));
 
       PathHistory.findOneAndUpdate(
@@ -666,9 +634,6 @@ io.on('connection', (socket) => {
 // ─── Auto-Cleanup (48 h — only Location + PathHistory, NEVER UserRegistry) ────
 setInterval(async () => {
   try {
-    // 48-hour cutoff — a user who hasn't pushed a location in 2 days gets
-    // their ephemeral data cleaned, but their Track ID in UserRegistry is SAFE.
-    // Redis keys self-expire after REDIS_TTL seconds — no manual cleanup needed.
     const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
     const [dl, dp] = await Promise.all([
       Location.deleteMany({ timestamp: { $lt: cutoff } }),
@@ -676,12 +641,11 @@ setInterval(async () => {
     ]);
     if (dl.deletedCount > 0 || dp.deletedCount > 0) {
       console.log(`🧹 Auto-cleanup: ${dl.deletedCount} stale locations, ${dp.deletedCount} stale paths`);
-      console.log('   UserRegistry was NOT touched — all track IDs are safe.');
     }
   } catch (err) {
     console.error('Auto-cleanup error:', err);
   }
-}, 60 * 60 * 1000);  // runs every hour
+}, 60 * 60 * 1000);
 
 // ─── Error handlers ───────────────────────────────────────────────────────────
 app.use((req, res) => {
