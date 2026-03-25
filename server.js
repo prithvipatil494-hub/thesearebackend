@@ -5,9 +5,42 @@ const mongoose = require('mongoose');
 const cors     = require('cors');
 const http     = require('http');
 const socketIo = require('socket.io');
+const Redis    = require('ioredis');
 
 const app    = express();
 const server = http.createServer(app);
+
+// ─── Redis ────────────────────────────────────────────────────────────────────
+// Install:  npm install ioredis
+// Locations are cached with a 30-second TTL — fast reads, auto-expires stale data.
+
+const redis = new Redis(
+  "redis://default:4rgHpsmaNQ2qIXA8ktlxeoX2UFNdFXKQ@redis-16268.crce292.ap-south-1-2.ec2.cloud.redislabs.com:16268",
+  {
+    connectTimeout: 5000,
+    maxRetriesPerRequest: 2,
+    lazyConnect: false,
+  }
+);
+
+redis.on("connect", () => console.log("✅ Redis connected"));
+redis.on("error",   (e) => console.error("❌ Redis error:", e.message));
+
+const REDIS_TTL = 30;  // seconds — location expires after 30 s → isRecent = false on client
+
+/** Write location to Redis with TTL */
+async function cacheLocation(trackId, data) {
+  const key     = `loc:${trackId}`;
+  const payload = JSON.stringify({ ...data, ts: Date.now() });
+  await redis.setex(key, REDIS_TTL, payload);
+}
+
+/** Write a targeted location (only readable by a specific recipient) */
+async function cacheLocationTargeted(trackId, recipientId, data) {
+  const key     = `loc:${trackId}:for:${recipientId}`;
+  const payload = JSON.stringify({ ...data, ts: Date.now() });
+  await redis.setex(key, REDIS_TTL, payload);
+}
 
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = socketIo(server, {
@@ -162,27 +195,28 @@ async function generateUniqueTrackId() {
 
 app.get('/', (req, res) => {
   res.json({
-    message:   '✅ LiveLoc Backend v2 — Persistent Track IDs',
+    message:   '✅ LiveLoc Backend v2 — Persistent Track IDs + Redis Cache',
     status:    'online',
     timestamp: new Date().toISOString(),
     design: {
       userRegistry: 'PERMANENT — track IDs never deleted',
-      locations:    'Ephemeral — cleaned after 48 h inactivity',
+      locations:    'Ephemeral — Redis (30s TTL) + MongoDB fallback (cleaned after 48 h)',
       pathHistory:  'Rolling 24 h buffer',
       chat:         'Persistent — never deleted',
     },
     endpoints: {
-      health:           'GET  /api/health',
-      ensureTrackId:    'POST /api/track/ensure',
-      updateLocation:   'POST /api/location/update',
-      getLocation:      'GET  /api/location/:trackId',
-      getPath:          'GET  /api/path/:trackId',
-      deactivate:       'POST /api/location/deactivate/:trackId',
-      sendMessage:      'POST /api/chat/send',
-      getConversations: 'GET  /api/chat/conversations/:trackId',
-      getMessages:      'GET  /api/chat/messages/:conversationId',
-      markRead:         'POST /api/chat/read',
-      stats:            'GET  /api/stats',
+      health:               'GET  /api/health',
+      ensureTrackId:        'POST /api/track/ensure',
+      updateLocation:       'POST /api/location/update',
+      updateLocationTarget: 'POST /api/location/update-targeted',
+      getLocation:          'GET  /api/location/:trackId?viewer=<trackId>',
+      getPath:              'GET  /api/path/:trackId',
+      deactivate:           'POST /api/location/deactivate/:trackId',
+      sendMessage:          'POST /api/chat/send',
+      getConversations:     'GET  /api/chat/conversations/:trackId',
+      getMessages:          'GET  /api/chat/messages/:conversationId',
+      markRead:             'POST /api/chat/read',
+      stats:                'GET  /api/stats',
     },
   });
 });
@@ -268,7 +302,7 @@ app.post('/api/track/generate', async (req, res) => {
   }
 });
 
-// ── /api/location/update ──────────────────────────────────────────────────────
+// ── /api/location/update  (broadcast — visible to everyone) ──────────────────
 app.post('/api/location/update', async (req, res) => {
   try {
     const { trackId, uid, lat, lng, speed = 0, accuracy = 0 } = req.body;
@@ -280,6 +314,12 @@ app.post('/api/location/update', async (req, res) => {
       return res.status(400).json({ error: 'Invalid coordinates' });
     }
 
+    const data = { trackId, uid, lat, lng, accuracy, speed };
+
+    // 1. Write to Redis immediately (sub-millisecond read for pollers)
+    await cacheLocation(trackId, data);
+
+    // 2. Persist to MongoDB in the background (don't await — no latency hit)
     const updateFields = {
       lat, lng, speed, accuracy,
       timestamp: new Date(),
@@ -287,14 +327,14 @@ app.post('/api/location/update', async (req, res) => {
       ...(uid ? { uid } : {}),
     };
 
-    const location = await Location.findOneAndUpdate(
+    Location.findOneAndUpdate(
       { trackId },
       updateFields,
       { upsert: true, new: true }
-    );
+    ).catch(e => console.error('DB write error:', e.message));
 
-    // Path history — rolling buffer
-    await PathHistory.findOneAndUpdate(
+    // 3. Append to path history in the background
+    PathHistory.findOneAndUpdate(
       { trackId },
       {
         $push: {
@@ -306,43 +346,94 @@ app.post('/api/location/update', async (req, res) => {
         lastUpdated: new Date(),
       },
       { upsert: true }
-    );
+    ).catch(e => console.error('PathHistory write error:', e.message));
 
     const payload = { trackId, lat, lng, speed, accuracy, timestamp: new Date() };
     io.emit('location:updated', payload);
     io.to(`track:${trackId}`).emit('location:updated', payload);
     io.emit(`location:${trackId}`, payload);
 
-    res.json({ success: true, location });
+    res.json({ ok: true });
   } catch (error) {
     console.error('Error updating location:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ── /api/location/:trackId ────────────────────────────────────────────────────
+// ── /api/location/update-targeted  (only the named recipient can read) ────────
+// Stores under a compound key  loc:<senderTrackId>:for:<recipientTrackId>
+// The recipient polls GET /api/location/:trackId?viewer=<theirTrackId>
+router.post('/api/location/update-targeted', async (req, res) => {
+  try {
+    const { trackId, uid, lat, lng, accuracy = 0, speed = 0, recipientId } = req.body;
+    if (!trackId || !recipientId || lat == null || lng == null)
+      return res.status(400).json({ error: 'Missing fields' });
+
+    const data = { trackId, uid, lat, lng, accuracy, speed };
+
+    // Store under targeted key — only the recipient can read this
+    await cacheLocationTargeted(trackId, recipientId, data);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('update-targeted error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── /api/location/:trackId  (Redis-first, MongoDB fallback) ───────────────────
+//
+// Pass ?viewer=<callerTrackId> to also check targeted keys.
+//
+// Priority:
+//   1. Targeted key  loc:<trackId>:for:<viewerTrackId>   (if viewer provided)
+//   2. Broadcast key loc:<trackId>
+//   3. MongoDB fallback (for locations older than Redis TTL)
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/location/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
+    const viewerId    = req.query.viewer;  // optional
+
     if (!trackId) return res.status(400).json({ error: 'Track ID is required' });
 
-    // Verify the track ID exists in the registry first (even if location is stale)
+    // ── 1. Try Redis (targeted key first, then broadcast) ─────────────────────
+    let raw = null;
+
+    if (viewerId) {
+      raw = await redis.get(`loc:${trackId}:for:${viewerId}`);
+    }
+    if (!raw) {
+      raw = await redis.get(`loc:${trackId}`);
+    }
+
+    if (raw) {
+      const data  = JSON.parse(raw);
+      const ageMs = Date.now() - (data.ts ?? 0);
+      return res.json({
+        ...data,
+        isRecent:    ageMs < REDIS_TTL * 1000,
+        hasLocation: true,
+      });
+    }
+
+    // ── 2. Redis miss — verify the track ID exists in the registry ────────────
     const registered = await UserRegistry.findOne({ trackId });
     if (!registered) {
       return res.status(404).json({ error: 'Track ID not found' });
     }
 
+    // ── 3. MongoDB fallback (stale / historical data) ─────────────────────────
     const location = await Location.findOne({ trackId });
     if (!location) {
-      // The user is registered but hasn't pushed a location yet (or it was cleaned up).
-      // Return a "registered but no location" response rather than a hard 404.
+      // Registered but no location pushed yet (or cleaned up).
       return res.json({
         trackId,
-        lat:      null,
-        lng:      null,
-        speed:    0,
-        accuracy: 0,
-        isRecent: false,
+        lat:         null,
+        lng:         null,
+        speed:       0,
+        accuracy:    0,
+        isRecent:    false,
         hasLocation: false,
       });
     }
@@ -378,6 +469,9 @@ app.post('/api/location/deactivate/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
     if (!trackId) return res.status(400).json({ error: 'Track ID is required' });
+
+    // Remove from Redis immediately
+    await redis.del(`loc:${trackId}`);
 
     await Location.findOneAndUpdate({ trackId }, { isActive: false });
     console.log(`📍 Location deactivated for ${trackId}`);
@@ -427,7 +521,7 @@ app.post('/api/cleanup', async (req, res) => {
       success: true,
       deletedLocations: dl.deletedCount,
       deletedPaths:     dp.deletedCount,
-      note: 'UserRegistry (track IDs) was NOT touched.',
+      note: 'UserRegistry (track IDs) was NOT touched. Redis keys expire automatically.',
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -542,13 +636,19 @@ io.on('connection', (socket) => {
         socket.emit('error', { message: 'Invalid coordinates' }); return;
       }
 
+      // Write to Redis first
+      await cacheLocation(trackId, { trackId, uid, lat, lng, speed, accuracy });
+
+      // Persist to MongoDB in the background
       const fields = { lat, lng, speed, accuracy, timestamp: new Date(), isActive: true, ...(uid ? { uid } : {}) };
-      await Location.findOneAndUpdate({ trackId }, fields, { upsert: true });
-      await PathHistory.findOneAndUpdate(
+      Location.findOneAndUpdate({ trackId }, fields, { upsert: true })
+        .catch(e => console.error('Socket DB write error:', e.message));
+
+      PathHistory.findOneAndUpdate(
         { trackId },
         { $push: { points: { $each: [{ lat, lng, timestamp: new Date() }], $slice: -1000 } }, lastUpdated: new Date() },
         { upsert: true }
-      );
+      ).catch(e => console.error('Socket PathHistory write error:', e.message));
 
       const payload = { trackId, lat, lng, speed, accuracy, timestamp: new Date() };
       io.emit('location:updated', payload);
@@ -568,6 +668,7 @@ setInterval(async () => {
   try {
     // 48-hour cutoff — a user who hasn't pushed a location in 2 days gets
     // their ephemeral data cleaned, but their Track ID in UserRegistry is SAFE.
+    // Redis keys self-expire after REDIS_TTL seconds — no manual cleanup needed.
     const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
     const [dl, dp] = await Promise.all([
       Location.deleteMany({ timestamp: { $lt: cutoff } }),
@@ -596,6 +697,7 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 Socket.IO ready`);
+  console.log(`⚡ Redis cache active (${REDIS_TTL}s TTL)`);
   console.log(`🔒 UserRegistry is permanent — track IDs never deleted`);
   console.log(`🧹 Auto-cleanup targets only Location + PathHistory (48 h cutoff)`);
 });
