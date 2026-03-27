@@ -83,18 +83,25 @@ const conversationSchema = new mongoose.Schema({
   unread:         { type: Map, of: Number, default: {} }
 });
 
-// ── NEW: User schema (required by Android app) ────────────────────────────────
 const userSchema = new mongoose.Schema({
   uid:         { type: String, required: true, unique: true, index: true },
   trackId:     { type: String, required: true, index: true },
   displayName: { type: String, default: '' },
   email:       { type: String, default: '' },
   friends:     { type: [String], default: [] },
+  // savedFriends stores richer info: [{trackId, displayName, email}]
+  savedFriends: {
+    type: [{
+      trackId:     String,
+      displayName: String,
+      email:       String
+    }],
+    default: []
+  },
   createdAt:   { type: Date, default: Date.now },
   updatedAt:   { type: Date, default: Date.now }
 });
 
-// ── NEW: Session schema (path recording) ─────────────────────────────────────
 const sessionSchema = new mongoose.Schema({
   sessionId: { type: String, required: true, unique: true, index: true },
   uid:       { type: String, required: true, index: true },
@@ -136,23 +143,23 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ==================== USER ROUTES (needed by Android) ====================
+// ==================== USER ROUTES ====================
 
-// GET /api/user/:uid  — fetch user doc (trackId + friends list)
+// GET /api/user/:uid  — fetch user doc (trackId + friends list + savedFriends)
 app.get('/api/user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
     const user = await User.findOne({ uid });
     if (!user) {
-      // Return 404 so Android knows to create the user
       return res.status(404).json({ error: 'User not found' });
     }
     res.json({
-      uid:         user.uid,
-      trackId:     user.trackId,
-      displayName: user.displayName,
-      email:       user.email,
-      friends:     user.friends
+      uid:          user.uid,
+      trackId:      user.trackId,
+      displayName:  user.displayName,
+      email:        user.email,
+      friends:      user.friends,
+      savedFriends: user.savedFriends || []
     });
   } catch (error) {
     console.error('Error fetching user:', error);
@@ -160,7 +167,28 @@ app.get('/api/user/:uid', async (req, res) => {
   }
 });
 
-// POST /api/user/upsert  — create or update user (called on login and name change)
+// GET /api/user/by-trackid/:trackId
+// Look up a user's public profile by their Track ID (used by "Add Friend" flow)
+app.get('/api/user/by-trackid/:trackId', async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    const user = await User.findOne({ trackId });
+    if (!user) {
+      return res.status(404).json({ error: 'No user found for this Track ID' });
+    }
+    res.json({
+      uid:         user.uid,
+      trackId:     user.trackId,
+      displayName: user.displayName,
+      email:       user.email
+    });
+  } catch (error) {
+    console.error('Error fetching user by trackId:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/user/upsert  — create or update user
 app.post('/api/user/upsert', async (req, res) => {
   try {
     const { uid, trackId, displayName, email } = req.body;
@@ -181,8 +209,6 @@ app.post('/api/user/upsert', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // Also make sure the Location document exists for this trackId
-    // so friends polling GET /api/location/:trackId don't get 404
     await Location.findOneAndUpdate(
       { trackId },
       { $setOnInsert: { trackId, lat: 0, lng: 0, isActive: false } },
@@ -197,10 +223,10 @@ app.post('/api/user/upsert', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/friends  — overwrite friends list
+// POST /api/user/:uid/friends  — overwrite live-tracking friends list (trackIds only)
 app.post('/api/user/:uid/friends', async (req, res) => {
   try {
-    const { uid }    = req.params;
+    const { uid }     = req.params;
     const { friends } = req.body;
 
     if (!Array.isArray(friends)) {
@@ -225,9 +251,36 @@ app.post('/api/user/:uid/friends', async (req, res) => {
   }
 });
 
+// POST /api/user/:uid/saved-friends  — overwrite saved friends list (rich objects)
+app.post('/api/user/:uid/saved-friends', async (req, res) => {
+  try {
+    const { uid }          = req.params;
+    const { savedFriends } = req.body;
+
+    if (!Array.isArray(savedFriends)) {
+      return res.status(400).json({ error: 'savedFriends must be an array' });
+    }
+
+    const user = await User.findOneAndUpdate(
+      { uid },
+      { savedFriends, updatedAt: new Date() },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    console.log(`💾 SavedFriends updated for ${uid}: ${savedFriends.length} entries`);
+    res.json({ success: true, savedFriends: user.savedFriends });
+  } catch (error) {
+    console.error('Error updating saved friends:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== TRACK ID ROUTES ====================
 
-// Generate new Track ID
 app.post('/api/track/generate', async (req, res) => {
   try {
     let trackId;
@@ -248,7 +301,6 @@ app.post('/api/track/generate', async (req, res) => {
 
 // ==================== LOCATION ROUTES ====================
 
-// POST /api/location/update
 app.post('/api/location/update', async (req, res) => {
   try {
     const { trackId, lat, lng, speed, accuracy } = req.body;
@@ -308,9 +360,6 @@ app.post('/api/location/update', async (req, res) => {
   }
 });
 
-// GET /api/location/:trackId
-// FIX: was returning 404 for unknown trackId — Android httpGet() returns null on non-200,
-// so friends who haven't pushed yet would never resolve. Now returns {isRecent:false} stub.
 app.get('/api/location/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -322,13 +371,9 @@ app.get('/api/location/:trackId', async (req, res) => {
     const location = await Location.findOne({ trackId });
 
     if (!location) {
-      // Return a valid 200 with isRecent:false instead of 404
-      // so Android doesn't treat it as a network error
       return res.json({ trackId, isRecent: false, notFound: true });
     }
 
-    // FIX: extended threshold from 30s → 60s to handle Render.com cold-start latency
-    // and the 2s push interval from Android
     const sixtySecondsAgo = new Date(Date.now() - 60000);
     const isRecent = location.timestamp > sixtySecondsAgo;
 
@@ -348,7 +393,6 @@ app.get('/api/location/:trackId', async (req, res) => {
   }
 });
 
-// GET /api/path/:trackId
 app.get('/api/path/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -366,7 +410,6 @@ app.get('/api/path/:trackId', async (req, res) => {
   }
 });
 
-// POST /api/location/deactivate/:trackId
 app.post('/api/location/deactivate/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -379,9 +422,8 @@ app.post('/api/location/deactivate/:trackId', async (req, res) => {
   }
 });
 
-// ==================== SESSION ROUTES (needed by Android recording) ====================
+// ==================== SESSION ROUTES ====================
 
-// POST /api/session/start
 app.post('/api/session/start', async (req, res) => {
   try {
     const { sessionId, uid, trackId, startTime } = req.body;
@@ -401,7 +443,6 @@ app.post('/api/session/start', async (req, res) => {
     console.log(`⏺ Session started: ${sessionId} for ${trackId}`);
     res.json({ success: true, sessionId: session.sessionId });
   } catch (error) {
-    // Duplicate sessionId — idempotent, return success
     if (error.code === 11000) {
       return res.json({ success: true, sessionId });
     }
@@ -410,7 +451,6 @@ app.post('/api/session/start', async (req, res) => {
   }
 });
 
-// POST /api/session/:sessionId/point  — append a GPS point to recording
 app.post('/api/session/:sessionId/point', async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -426,7 +466,7 @@ app.post('/api/session/:sessionId/point', async (req, res) => {
         $push: {
           points: {
             $each:  [{ lat, lng, timestamp: new Date() }],
-            $slice: -5000   // keep up to 5000 points per session
+            $slice: -5000
           }
         }
       }
@@ -439,7 +479,6 @@ app.post('/api/session/:sessionId/point', async (req, res) => {
   }
 });
 
-// PATCH /api/session/:sessionId/end
 app.patch('/api/session/:sessionId/end', async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -458,7 +497,6 @@ app.patch('/api/session/:sessionId/end', async (req, res) => {
   }
 });
 
-// GET /api/session/:uid/list  — optional: list all sessions for a user
 app.get('/api/session/:uid/list', async (req, res) => {
   try {
     const { uid } = req.params;
