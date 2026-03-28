@@ -71,7 +71,9 @@ const messageSchema = new mongoose.Schema({
   senderId:       String,
   senderName:     String,
   text:           String,
-  timestamp:      { type: Number, default: () => Date.now() }
+  timestamp:      { type: Number, default: () => Date.now() },
+  // readBy: array of trackIds who have opened this conversation
+  readBy:         { type: [String], default: [] }
 });
 
 const conversationSchema = new mongoose.Schema({
@@ -89,7 +91,6 @@ const userSchema = new mongoose.Schema({
   displayName: { type: String, default: '' },
   email:       { type: String, default: '' },
   friends:     { type: [String], default: [] },
-  // savedFriends stores richer info: [{trackId, displayName, email}]
   savedFriends: {
     type: [{
       trackId:     String,
@@ -145,7 +146,6 @@ app.get('/api/health', (req, res) => {
 
 // ==================== USER ROUTES ====================
 
-// GET /api/user/:uid  — fetch user doc (trackId + friends list + savedFriends)
 app.get('/api/user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
@@ -167,8 +167,6 @@ app.get('/api/user/:uid', async (req, res) => {
   }
 });
 
-// GET /api/user/by-trackid/:trackId
-// Look up a user's public profile by their Track ID (used by "Add Friend" flow)
 app.get('/api/user/by-trackid/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -188,7 +186,6 @@ app.get('/api/user/by-trackid/:trackId', async (req, res) => {
   }
 });
 
-// POST /api/user/upsert  — create or update user
 app.post('/api/user/upsert', async (req, res) => {
   try {
     const { uid, trackId, displayName, email } = req.body;
@@ -223,7 +220,6 @@ app.post('/api/user/upsert', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/friends  — overwrite live-tracking friends list (trackIds only)
 app.post('/api/user/:uid/friends', async (req, res) => {
   try {
     const { uid }     = req.params;
@@ -251,7 +247,6 @@ app.post('/api/user/:uid/friends', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/saved-friends  — overwrite saved friends list (rich objects)
 app.post('/api/user/:uid/saved-friends', async (req, res) => {
   try {
     const { uid }          = req.params;
@@ -548,7 +543,14 @@ app.post('/api/chat/send', async (req, res) => {
     }
 
     const ts = Date.now();
-    await Message.create({ conversationId, senderId, senderName, text, timestamp: ts });
+    const message = await Message.create({
+      conversationId,
+      senderId,
+      senderName,
+      text,
+      timestamp: ts,
+      readBy: [senderId]   // sender has already "read" their own message
+    });
 
     await Conversation.findOneAndUpdate(
       { conversationId },
@@ -566,14 +568,27 @@ app.post('/api/chat/send', async (req, res) => {
       { upsert: true, new: true }
     );
 
+    // Broadcast new message to everyone in the conversation room
     io.to(`conversation:${conversationId}`).emit('chat:message', {
-      conversationId, senderId, senderName, text, timestamp: ts
-    });
-    io.to(`user:${receiverId}`).emit('chat:newMessage', {
-      conversationId, senderId, senderName, text, timestamp: ts
+      _id:            message._id.toString(),
+      conversationId,
+      senderId,
+      senderName,
+      text,
+      timestamp:      ts,
+      readBy:         [senderId]
     });
 
-    res.json({ ok: true });
+    io.to(`user:${receiverId}`).emit('chat:newMessage', {
+      _id:            message._id.toString(),
+      conversationId,
+      senderId,
+      senderName,
+      text,
+      timestamp:      ts
+    });
+
+    res.json({ ok: true, messageId: message._id.toString() });
   } catch (error) {
     console.error('Error sending message:', error);
     res.status(500).json({ error: error.message });
@@ -602,26 +617,117 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
     const msgs = await Message.find({ conversationId }).sort({ timestamp: 1 }).limit(200);
-    res.json(msgs);
+    res.json(msgs.map(m => ({
+      _id:            m._id.toString(),
+      conversationId: m.conversationId,
+      senderId:       m.senderId,
+      senderName:     m.senderName,
+      text:           m.text,
+      timestamp:      m.timestamp,
+      readBy:         m.readBy || []
+    })));
   } catch (error) {
     console.error('Error fetching messages:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// Mark conversation as read — also pushes myTrackId into readBy for all unread messages
 app.post('/api/chat/read', async (req, res) => {
   try {
     const { conversationId, trackId } = req.body;
     if (!conversationId || !trackId) {
       return res.status(400).json({ error: 'conversationId and trackId required' });
     }
+
+    // Reset unread counter
     await Conversation.findOneAndUpdate(
       { conversationId },
       { $set: { [`unread.${trackId}`]: 0 } }
     );
+
+    // Add trackId to readBy for every message in this conversation not yet read by them
+    await Message.updateMany(
+      { conversationId, readBy: { $ne: trackId } },
+      { $addToSet: { readBy: trackId } }
+    );
+
+    // Notify both participants that messages were read, so ticks update in real-time
+    io.to(`conversation:${conversationId}`).emit('chat:read', {
+      conversationId,
+      readBy: trackId
+    });
+
     res.json({ ok: true });
   } catch (error) {
     console.error('Error marking as read:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── DELETE single message for everyone ──────────────────────────────────────
+// Only the original sender should call this (enforced client-side).
+// Removes the document from DB and broadcasts deletion to all room members.
+app.delete('/api/chat/message/:messageId', async (req, res) => {
+  try {
+    const { messageId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(messageId)) {
+      return res.status(400).json({ error: 'Invalid message ID' });
+    }
+
+    const message = await Message.findById(messageId);
+    if (!message) {
+      // Already deleted — treat as success so client stays in sync
+      return res.json({ ok: true, alreadyDeleted: true });
+    }
+
+    const { conversationId } = message;
+
+    await Message.deleteOne({ _id: messageId });
+
+    // Update conversation's lastMessage if this was the most recent one
+    const latestMsg = await Message.findOne({ conversationId }).sort({ timestamp: -1 });
+    await Conversation.findOneAndUpdate(
+      { conversationId },
+      {
+        lastMessage:   latestMsg ? latestMsg.text       : '',
+        lastTimestamp: latestMsg ? latestMsg.timestamp  : 0
+      }
+    );
+
+    // Broadcast deletion so both devices remove the bubble immediately
+    io.to(`conversation:${conversationId}`).emit('chat:messageDeleted', {
+      messageId,
+      conversationId
+    });
+
+    console.log(`🗑 Message deleted for everyone: ${messageId} in ${conversationId}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error deleting message:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── DELETE all messages in a conversation ───────────────────────────────────
+app.delete('/api/chat/messages/:conversationId', async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+
+    await Message.deleteMany({ conversationId });
+
+    await Conversation.findOneAndUpdate(
+      { conversationId },
+      { lastMessage: '', lastTimestamp: 0 }
+    );
+
+    io.to(`conversation:${conversationId}`).emit('chat:cleared', { conversationId });
+
+    console.log(`🗑 Chat cleared: ${conversationId}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error clearing chat:', error);
     res.status(500).json({ error: error.message });
   }
 });
