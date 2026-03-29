@@ -27,7 +27,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json({ limit: '5mb' }));   // ← raised limit to allow avatarBase64
+// Raise body size limit to 10 MB to accommodate base64 image payloads
+app.use(express.json({ limit: '10mb' }));
 
 const MONGODB_URI = process.env.MONGODB_URI || 'your_mongodb_connection_string_here';
 
@@ -66,13 +67,17 @@ pathHistorySchema.pre('save', function(next) {
   next();
 });
 
+// ─── Message schema — now includes type + imageBase64 ─────────────────────────
 const messageSchema = new mongoose.Schema({
   conversationId: { type: String, index: true },
   senderId:       String,
   senderName:     String,
   text:           String,
   timestamp:      { type: Number, default: () => Date.now() },
-  readBy:         { type: [String], default: [] }
+  readBy:         { type: [String], default: [] },
+  // Photo sharing fields
+  type:           { type: String, default: 'text', enum: ['text', 'image'] },
+  imageBase64:    { type: String, default: '' }   // base64-encoded JPEG, max ~750 KB
 });
 messageSchema.index({ conversationId: 1, timestamp: 1 });
 messageSchema.index({ conversationId: 1, readBy: 1 });
@@ -91,7 +96,7 @@ const userSchema = new mongoose.Schema({
   trackId:      { type: String, required: true, index: true },
   displayName:  { type: String, default: '' },
   email:        { type: String, default: '' },
-  avatarBase64: { type: String, default: '' },        // ← profile picture
+  avatarBase64: { type: String, default: '' },
   friends:      { type: [String], default: [] },
   savedFriends: {
     type: [{
@@ -130,90 +135,45 @@ const Session      = mongoose.model('Session',      sessionSchema);
 // ==================== REST API ROUTES ====================
 
 app.get('/', (req, res) => {
-  res.json({
-    message: '✅ Location Tracker Backend API is running!',
-    status: 'online',
-    timestamp: new Date().toISOString()
-  });
+  res.json({ message: '✅ Location Tracker Backend API is running!', status: 'online', timestamp: new Date().toISOString() });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    timestamp: new Date(),
-    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    uptime: process.uptime()
-  });
+  res.json({ status: 'OK', timestamp: new Date(), database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime() });
 });
 
 // ==================== USER ROUTES ====================
-// CRITICAL: by-trackid MUST be before /:uid
 
-// GET /api/user/by-trackid/:trackId
 app.get('/api/user/by-trackid/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
-    const user = await User.findOne({ trackId: trackId.trim().toUpperCase() })
-      || await User.findOne({ trackId });
-    if (!user) {
-      return res.status(404).json({ error: 'No user found for this Track ID' });
-    }
-    res.json({
-      uid:          user.uid,
-      trackId:      user.trackId,
-      displayName:  user.displayName,
-      email:        user.email,
-      avatarBase64: user.avatarBase64 || ''
-    });
+    const user = await User.findOne({ trackId: trackId.trim().toUpperCase() }) || await User.findOne({ trackId });
+    if (!user) return res.status(404).json({ error: 'No user found for this Track ID' });
+    res.json({ uid: user.uid, trackId: user.trackId, displayName: user.displayName, email: user.email, avatarBase64: user.avatarBase64 || '' });
   } catch (error) {
     console.error('Error fetching user by trackId:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/user/:uid
 app.get('/api/user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
     const user = await User.findOne({ uid });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    res.json({
-      uid:          user.uid,
-      trackId:      user.trackId,
-      displayName:  user.displayName,
-      email:        user.email,
-      avatarBase64: user.avatarBase64 || '',
-      friends:      user.friends,
-      savedFriends: user.savedFriends || []
-    });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ uid: user.uid, trackId: user.trackId, displayName: user.displayName, email: user.email, avatarBase64: user.avatarBase64 || '', friends: user.friends, savedFriends: user.savedFriends || [] });
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST /api/user/upsert
 app.post('/api/user/upsert', async (req, res) => {
   try {
     const { uid, trackId, displayName, email } = req.body;
-    if (!uid || !trackId) {
-      return res.status(400).json({ error: 'uid and trackId are required' });
-    }
-
-    const user = await User.findOneAndUpdate(
-      { uid },
-      { uid, trackId, displayName: displayName || '', email: email || '', updatedAt: new Date() },
-      { upsert: true, new: true }
-    );
-
-    await Location.findOneAndUpdate(
-      { trackId },
-      { $setOnInsert: { trackId, lat: 0, lng: 0, isActive: false } },
-      { upsert: true }
-    );
-
+    if (!uid || !trackId) return res.status(400).json({ error: 'uid and trackId are required' });
+    const user = await User.findOneAndUpdate({ uid }, { uid, trackId, displayName: displayName || '', email: email || '', updatedAt: new Date() }, { upsert: true, new: true });
+    await Location.findOneAndUpdate({ trackId }, { $setOnInsert: { trackId, lat: 0, lng: 0, isActive: false } }, { upsert: true });
     console.log(`👤 User upserted: ${uid} → ${trackId}`);
     res.json({ success: true, user });
   } catch (error) {
@@ -222,21 +182,13 @@ app.post('/api/user/upsert', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/avatar  — save profile picture base64
-// App calls: httpPost("/api/user/${user.uid}/avatar", {avatarBase64: b64})
 app.post('/api/user/:uid/avatar', async (req, res) => {
   try {
     const { uid }          = req.params;
     const { avatarBase64 } = req.body;
     if (!avatarBase64) return res.status(400).json({ error: 'avatarBase64 required' });
-
-    const user = await User.findOneAndUpdate(
-      { uid },
-      { avatarBase64, updatedAt: new Date() },
-      { new: true }
-    );
+    const user = await User.findOneAndUpdate({ uid }, { avatarBase64, updatedAt: new Date() }, { new: true });
     if (!user) return res.status(404).json({ error: 'User not found' });
-
     console.log(`🖼 Avatar updated for ${uid}`);
     res.json({ success: true });
   } catch (error) {
@@ -245,17 +197,12 @@ app.post('/api/user/:uid/avatar', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/friends
 app.post('/api/user/:uid/friends', async (req, res) => {
   try {
-    const { uid }     = req.params;
+    const { uid } = req.params;
     const { friends } = req.body;
-    if (!Array.isArray(friends)) {
-      return res.status(400).json({ error: 'friends must be an array' });
-    }
-    const user = await User.findOneAndUpdate(
-      { uid }, { friends, updatedAt: new Date() }, { new: true }
-    );
+    if (!Array.isArray(friends)) return res.status(400).json({ error: 'friends must be an array' });
+    const user = await User.findOneAndUpdate({ uid }, { friends, updatedAt: new Date() }, { new: true });
     if (!user) return res.status(404).json({ error: 'User not found' });
     console.log(`👥 Friends updated for ${uid}: [${friends.join(', ')}]`);
     res.json({ success: true, friends: user.friends });
@@ -265,17 +212,12 @@ app.post('/api/user/:uid/friends', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/saved-friends
 app.post('/api/user/:uid/saved-friends', async (req, res) => {
   try {
-    const { uid }          = req.params;
+    const { uid } = req.params;
     const { savedFriends } = req.body;
-    if (!Array.isArray(savedFriends)) {
-      return res.status(400).json({ error: 'savedFriends must be an array' });
-    }
-    const user = await User.findOneAndUpdate(
-      { uid }, { savedFriends, updatedAt: new Date() }, { new: true }
-    );
+    if (!Array.isArray(savedFriends)) return res.status(400).json({ error: 'savedFriends must be an array' });
+    const user = await User.findOneAndUpdate({ uid }, { savedFriends, updatedAt: new Date() }, { new: true });
     if (!user) return res.status(404).json({ error: 'User not found' });
     console.log(`💾 SavedFriends updated for ${uid}: ${savedFriends.length} entries`);
     res.json({ success: true, savedFriends: user.savedFriends });
@@ -304,52 +246,21 @@ app.post('/api/track/generate', async (req, res) => {
 
 // ==================== LOCATION ROUTES ====================
 
-// POST /api/location/update
-// ── isRecent threshold: 8 seconds (was 60 s).
-//    With 800 ms push intervals, any fix older than 8 s means the user has
-//    gone offline or the network is very slow — mark them as not-recent.
 const IS_RECENT_MS = 8_000;
 
 app.post('/api/location/update', async (req, res) => {
   try {
     const { trackId, lat, lng, speed, accuracy } = req.body;
-    if (!trackId || lat === undefined || lng === undefined) {
-      return res.status(400).json({ error: 'Missing required fields: trackId, lat, lng' });
-    }
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-      return res.status(400).json({ error: 'Invalid coordinates' });
-    }
+    if (!trackId || lat === undefined || lng === undefined) return res.status(400).json({ error: 'Missing required fields: trackId, lat, lng' });
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return res.status(400).json({ error: 'Invalid coordinates' });
 
     const now = new Date();
-    const location = await Location.findOneAndUpdate(
-      { trackId },
-      { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true },
-      { upsert: true, new: true }
-    );
+    await Location.findOneAndUpdate({ trackId }, { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true }, { upsert: true, new: true });
+    PathHistory.findOneAndUpdate({ trackId }, { $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } }, lastUpdated: now }, { upsert: true }).catch(() => {});
 
-    // Append to path history — fire and forget so we don't slow down the response
-    PathHistory.findOneAndUpdate(
-      { trackId },
-      {
-        $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } },
-        lastUpdated: now
-      },
-      { upsert: true }
-    ).catch(() => {});
-
-    const updateData = {
-      trackId, lat, lng,
-      speed:     speed    || 0,
-      accuracy:  accuracy || 0,
-      timestamp: now,
-      isRecent:  true
-    };
-
-    // Broadcast immediately to all sockets tracking this person
+    const updateData = { trackId, lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isRecent: true };
     io.to(`track:${trackId}`).emit('location:updated', updateData);
-    // Also broadcast globally so any clients that haven't subscribed still get it
     io.emit('location:updated', updateData);
-
     res.json({ success: true });
   } catch (error) {
     console.error('Error updating location:', error);
@@ -357,29 +268,14 @@ app.post('/api/location/update', async (req, res) => {
   }
 });
 
-// GET /api/location/:trackId
 app.get('/api/location/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
     if (!trackId) return res.status(400).json({ error: 'Track ID is required' });
-
     const location = await Location.findOne({ trackId });
-    if (!location) {
-      return res.json({ trackId, isRecent: false, notFound: true });
-    }
-
-    // isRecent: last update within 8 seconds
+    if (!location) return res.json({ trackId, isRecent: false, notFound: true });
     const isRecent = location.timestamp > new Date(Date.now() - IS_RECENT_MS);
-    res.json({
-      trackId:   location.trackId,
-      lat:       location.lat,
-      lng:       location.lng,
-      speed:     location.speed,
-      accuracy:  location.accuracy,
-      timestamp: location.timestamp,
-      isActive:  location.isActive,
-      isRecent
-    });
+    res.json({ trackId: location.trackId, lat: location.lat, lng: location.lng, speed: location.speed, accuracy: location.accuracy, timestamp: location.timestamp, isActive: location.isActive, isRecent });
   } catch (error) {
     console.error('Error fetching location:', error);
     res.status(500).json({ error: error.message });
@@ -418,14 +314,8 @@ app.post('/api/location/deactivate/:trackId', async (req, res) => {
 app.post('/api/session/start', async (req, res) => {
   try {
     const { sessionId, uid, trackId, startTime } = req.body;
-    if (!sessionId || !uid || !trackId) {
-      return res.status(400).json({ error: 'sessionId, uid, and trackId are required' });
-    }
-    const session = await Session.create({
-      sessionId, uid, trackId,
-      startTime: startTime || new Date().toISOString(),
-      points: []
-    });
+    if (!sessionId || !uid || !trackId) return res.status(400).json({ error: 'sessionId, uid, and trackId are required' });
+    const session = await Session.create({ sessionId, uid, trackId, startTime: startTime || new Date().toISOString(), points: [] });
     console.log(`⏺ Session started: ${sessionId} for ${trackId}`);
     res.json({ success: true, sessionId: session.sessionId });
   } catch (error) {
@@ -439,13 +329,8 @@ app.post('/api/session/:sessionId/point', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { lat, lng }  = req.body;
-    if (lat === undefined || lng === undefined) {
-      return res.status(400).json({ error: 'lat and lng are required' });
-    }
-    await Session.findOneAndUpdate(
-      { sessionId },
-      { $push: { points: { $each: [{ lat, lng, timestamp: new Date() }], $slice: -5000 } } }
-    );
+    if (lat === undefined || lng === undefined) return res.status(400).json({ error: 'lat and lng are required' });
+    await Session.findOneAndUpdate({ sessionId }, { $push: { points: { $each: [{ lat, lng, timestamp: new Date() }], $slice: -5000 } } });
     res.json({ success: true });
   } catch (error) {
     console.error('Error adding session point:', error);
@@ -457,10 +342,7 @@ app.patch('/api/session/:sessionId/end', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { endTime }   = req.body;
-    await Session.findOneAndUpdate(
-      { sessionId },
-      { endTime: endTime || new Date().toISOString() }
-    );
+    await Session.findOneAndUpdate({ sessionId }, { endTime: endTime || new Date().toISOString() });
     console.log(`⏹ Session ended: ${sessionId}`);
     res.json({ success: true });
   } catch (error) {
@@ -484,12 +366,7 @@ app.get('/api/session/:uid/list', async (req, res) => {
 
 app.get('/api/stats', async (req, res) => {
   try {
-    const [totalLocations, activeLocations, totalUsers, totalSessions] = await Promise.all([
-      Location.countDocuments(),
-      Location.countDocuments({ isActive: true }),
-      User.countDocuments(),
-      Session.countDocuments()
-    ]);
+    const [totalLocations, activeLocations, totalUsers, totalSessions] = await Promise.all([Location.countDocuments(), Location.countDocuments({ isActive: true }), User.countDocuments(), Session.countDocuments()]);
     res.json({ totalLocations, activeLocations, totalUsers, totalSessions, timestamp: new Date() });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -499,10 +376,7 @@ app.get('/api/stats', async (req, res) => {
 app.post('/api/cleanup', async (req, res) => {
   try {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const [dl, dp] = await Promise.all([
-      Location.deleteMany({ timestamp: { $lt: cutoff } }),
-      PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })
-    ]);
+    const [dl, dp] = await Promise.all([Location.deleteMany({ timestamp: { $lt: cutoff } }), PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })]);
     res.json({ success: true, deletedLocations: dl.deletedCount, deletedPaths: dp.deletedCount });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -511,23 +385,41 @@ app.post('/api/cleanup', async (req, res) => {
 
 // ==================== CHAT ROUTES ====================
 
+// POST /api/chat/send
+// Accepts both text messages and image messages.
+// For images: { type: "image", text: "__image__", imageBase64: "<base64 string>" }
 app.post('/api/chat/send', async (req, res) => {
   try {
-    const { conversationId, senderId, senderName, receiverId, receiverName, text } = req.body;
+    const { conversationId, senderId, senderName, receiverId, receiverName, text, type, imageBase64 } = req.body;
 
-    if (!conversationId || !senderId || !receiverId || !text) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!conversationId || !senderId || !receiverId) {
+      return res.status(400).json({ error: 'Missing required fields: conversationId, senderId, receiverId' });
+    }
+
+    const msgType = (type === 'image') ? 'image' : 'text';
+
+    // Validate image payload
+    if (msgType === 'image' && (!imageBase64 || typeof imageBase64 !== 'string')) {
+      return res.status(400).json({ error: 'imageBase64 is required for image messages' });
+    }
+
+    // Guard: refuse excessively large payloads (> 8 MB base64 ≈ ~6 MB image)
+    if (msgType === 'image' && imageBase64.length > 8_000_000) {
+      return res.status(413).json({ error: 'Image too large. Max ~6 MB.' });
     }
 
     const ts = Date.now();
+    const displayText = msgType === 'image' ? '__image__' : (text || '');
 
     const savedMessage = await Message.create({
       conversationId,
       senderId,
       senderName,
-      text,
-      timestamp: ts,
-      readBy:    [senderId]
+      text:        displayText,
+      timestamp:   ts,
+      readBy:      [senderId],
+      type:        msgType,
+      imageBase64: msgType === 'image' ? imageBase64 : ''
     });
 
     await Conversation.findOneAndUpdate(
@@ -535,7 +427,7 @@ app.post('/api/chat/send', async (req, res) => {
       {
         $set: {
           conversationId,
-          lastMessage:             text,
+          lastMessage:             displayText,
           lastTimestamp:           ts,
           [`names.${senderId}`]:   senderName,
           [`names.${receiverId}`]: receiverName,
@@ -551,16 +443,18 @@ app.post('/api/chat/send', async (req, res) => {
       conversationId,
       senderId,
       senderName,
-      text,
+      text:           displayText,
       timestamp:      ts,
-      readBy:         [senderId]
+      readBy:         [senderId],
+      type:           msgType,
+      imageBase64:    msgType === 'image' ? imageBase64 : ''
     };
 
     io.to(`conversation:${conversationId}`).emit('chat:message', payload);
     io.to(`user:${receiverId}`).emit('chat:newMessage', payload);
     io.to(`user:${senderId}`).emit('chat:message', payload);
 
-    console.log(`💬 Message sent in ${conversationId} by ${senderId}`);
+    console.log(`💬 [${msgType}] Message sent in ${conversationId} by ${senderId}`);
     res.json({ ok: true, messageId: savedMessage._id.toString() });
 
   } catch (error) {
@@ -590,9 +484,7 @@ app.get('/api/chat/conversations/:trackId', async (req, res) => {
 app.get('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
-    const msgs = await Message.find({ conversationId })
-      .sort({ timestamp: 1 })
-      .limit(200);
+    const msgs = await Message.find({ conversationId }).sort({ timestamp: 1 }).limit(200);
     res.json(msgs.map(m => ({
       _id:            m._id.toString(),
       conversationId: m.conversationId,
@@ -600,7 +492,9 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       senderName:     m.senderName,
       text:           m.text,
       timestamp:      m.timestamp,
-      readBy:         m.readBy || []
+      readBy:         m.readBy || [],
+      type:           m.type || 'text',
+      imageBase64:    m.imageBase64 || ''
     })));
   } catch (error) {
     console.error('Error fetching messages:', error);
@@ -611,23 +505,11 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
 app.post('/api/chat/read', async (req, res) => {
   try {
     const { conversationId, trackId } = req.body;
-    if (!conversationId || !trackId) {
-      return res.status(400).json({ error: 'conversationId and trackId required' });
-    }
-
-    await Conversation.findOneAndUpdate(
-      { conversationId },
-      { $set: { [`unread.${trackId}`]: 0 } }
-    );
-
-    await Message.updateMany(
-      { conversationId, readBy: { $ne: trackId } },
-      { $addToSet: { readBy: trackId } }
-    );
-
+    if (!conversationId || !trackId) return res.status(400).json({ error: 'conversationId and trackId required' });
+    await Conversation.findOneAndUpdate({ conversationId }, { $set: { [`unread.${trackId}`]: 0 } });
+    await Message.updateMany({ conversationId, readBy: { $ne: trackId } }, { $addToSet: { readBy: trackId } });
     io.to(`conversation:${conversationId}`).emit('chat:read', { conversationId, readBy: trackId });
     io.to(`user:${trackId}`).emit('chat:read', { conversationId, readBy: trackId });
-
     res.json({ ok: true });
   } catch (error) {
     console.error('Error marking as read:', error);
@@ -638,28 +520,13 @@ app.post('/api/chat/read', async (req, res) => {
 app.delete('/api/chat/message/:messageId', async (req, res) => {
   try {
     const { messageId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(messageId)) {
-      return res.status(400).json({ error: 'Invalid message ID' });
-    }
-
+    if (!mongoose.Types.ObjectId.isValid(messageId)) return res.status(400).json({ error: 'Invalid message ID' });
     const message = await Message.findById(messageId);
-    if (!message) {
-      return res.json({ ok: true, alreadyDeleted: true });
-    }
-
+    if (!message) return res.json({ ok: true, alreadyDeleted: true });
     const { conversationId } = message;
     await Message.deleteOne({ _id: messageId });
-
     const latestMsg = await Message.findOne({ conversationId }).sort({ timestamp: -1 });
-    await Conversation.findOneAndUpdate(
-      { conversationId },
-      {
-        lastMessage:   latestMsg ? latestMsg.text      : '',
-        lastTimestamp: latestMsg ? latestMsg.timestamp : 0
-      }
-    );
-
+    await Conversation.findOneAndUpdate({ conversationId }, { lastMessage: latestMsg ? latestMsg.text : '', lastTimestamp: latestMsg ? latestMsg.timestamp : 0 });
     io.to(`conversation:${conversationId}`).emit('chat:messageDeleted', { messageId, conversationId });
     console.log(`🗑 Message deleted for everyone: ${messageId}`);
     res.json({ ok: true });
@@ -673,10 +540,7 @@ app.delete('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
     await Message.deleteMany({ conversationId });
-    await Conversation.findOneAndUpdate(
-      { conversationId },
-      { lastMessage: '', lastTimestamp: 0 }
-    );
+    await Conversation.findOneAndUpdate({ conversationId }, { lastMessage: '', lastTimestamp: 0 });
     io.to(`conversation:${conversationId}`).emit('chat:cleared', { conversationId });
     console.log(`🗑 Chat cleared: ${conversationId}`);
     res.json({ ok: true });
@@ -690,57 +554,19 @@ app.delete('/api/chat/messages/:conversationId', async (req, res) => {
 
 io.on('connection', (socket) => {
   console.log('👤 Socket connected:', socket.id);
-
-  socket.on('track:subscribe', (trackId) => {
-    socket.join(`track:${trackId}`);
-    socket.emit('track:subscribed', { trackId, success: true });
-  });
-
-  socket.on('track:unsubscribe', (trackId) => {
-    socket.leave(`track:${trackId}`);
-  });
-
-  socket.on('user:join', (trackId) => {
-    socket.join(`user:${trackId}`);
-    socket.emit('user:joined', { trackId, success: true });
-    console.log(`👤 ${trackId} joined personal room`);
-  });
-
-  socket.on('conversation:join', (conversationId) => {
-    socket.join(`conversation:${conversationId}`);
-    socket.emit('conversation:joined', { conversationId, success: true });
-  });
-
-  socket.on('conversation:leave', (conversationId) => {
-    socket.leave(`conversation:${conversationId}`);
-  });
-
+  socket.on('track:subscribe', (trackId) => { socket.join(`track:${trackId}`); socket.emit('track:subscribed', { trackId, success: true }); });
+  socket.on('track:unsubscribe', (trackId) => { socket.leave(`track:${trackId}`); });
+  socket.on('user:join', (trackId) => { socket.join(`user:${trackId}`); socket.emit('user:joined', { trackId, success: true }); console.log(`👤 ${trackId} joined personal room`); });
+  socket.on('conversation:join', (conversationId) => { socket.join(`conversation:${conversationId}`); socket.emit('conversation:joined', { conversationId, success: true }); });
+  socket.on('conversation:leave', (conversationId) => { socket.leave(`conversation:${conversationId}`); });
   socket.on('location:update', async (data) => {
     try {
       const { trackId, lat, lng, speed, accuracy } = data;
       if (!trackId || lat === undefined || lng === undefined) return;
-
       const now = new Date();
-      await Location.findOneAndUpdate(
-        { trackId },
-        { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true },
-        { upsert: true, new: true }
-      );
-
-      PathHistory.findOneAndUpdate(
-        { trackId },
-        {
-          $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } },
-          lastUpdated: now
-        },
-        { upsert: true }
-      ).catch(() => {});
-
-      const updateData = {
-        trackId, lat, lng,
-        speed: speed || 0, accuracy: accuracy || 0,
-        timestamp: now, isRecent: true
-      };
+      await Location.findOneAndUpdate({ trackId }, { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true }, { upsert: true, new: true });
+      PathHistory.findOneAndUpdate({ trackId }, { $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } }, lastUpdated: now }, { upsert: true }).catch(() => {});
+      const updateData = { trackId, lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isRecent: true };
       io.to(`track:${trackId}`).emit('location:updated', updateData);
       io.emit('location:updated', updateData);
     } catch (error) {
@@ -748,7 +574,6 @@ io.on('connection', (socket) => {
       socket.emit('error', { message: error.message });
     }
   });
-
   socket.on('ping', () => socket.emit('pong', { timestamp: new Date() }));
   socket.on('disconnect', (reason) => console.log('👤 Disconnected:', socket.id, reason));
   socket.on('error', (error) => console.error('Socket error:', error));
@@ -759,13 +584,8 @@ io.on('connection', (socket) => {
 setInterval(async () => {
   try {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const [dl, dp] = await Promise.all([
-      Location.deleteMany({ timestamp: { $lt: cutoff } }),
-      PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })
-    ]);
-    if (dl.deletedCount > 0 || dp.deletedCount > 0) {
-      console.log(`🧹 Auto-cleanup: ${dl.deletedCount} locations, ${dp.deletedCount} paths`);
-    }
+    const [dl, dp] = await Promise.all([Location.deleteMany({ timestamp: { $lt: cutoff } }), PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })]);
+    if (dl.deletedCount > 0 || dp.deletedCount > 0) console.log(`🧹 Auto-cleanup: ${dl.deletedCount} locations, ${dp.deletedCount} paths`);
   } catch (error) {
     console.error('Auto-cleanup error:', error);
   }
@@ -773,14 +593,8 @@ setInterval(async () => {
 
 // ==================== ERROR HANDLING ====================
 
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', path: req.path, method: req.method });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Global error:', err);
-  res.status(500).json({ error: 'Internal server error', message: err.message });
-});
+app.use((req, res) => { res.status(404).json({ error: 'Endpoint not found', path: req.path, method: req.method }); });
+app.use((err, req, res, next) => { console.error('Global error:', err); res.status(500).json({ error: 'Internal server error', message: err.message }); });
 
 // ==================== START ====================
 
