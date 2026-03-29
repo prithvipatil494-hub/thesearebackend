@@ -27,7 +27,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));   // ← raised limit to allow avatarBase64
 
 const MONGODB_URI = process.env.MONGODB_URI || 'your_mongodb_connection_string_here';
 
@@ -87,21 +87,23 @@ const conversationSchema = new mongoose.Schema({
 });
 
 const userSchema = new mongoose.Schema({
-  uid:         { type: String, required: true, unique: true, index: true },
-  trackId:     { type: String, required: true, index: true },
-  displayName: { type: String, default: '' },
-  email:       { type: String, default: '' },
-  friends:     { type: [String], default: [] },
+  uid:          { type: String, required: true, unique: true, index: true },
+  trackId:      { type: String, required: true, index: true },
+  displayName:  { type: String, default: '' },
+  email:        { type: String, default: '' },
+  avatarBase64: { type: String, default: '' },        // ← profile picture
+  friends:      { type: [String], default: [] },
   savedFriends: {
     type: [{
-      trackId:     String,
-      displayName: String,
-      email:       String
+      trackId:      String,
+      displayName:  String,
+      email:        String,
+      avatarBase64: String
     }],
     default: []
   },
-  createdAt:   { type: Date, default: Date.now },
-  updatedAt:   { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
 });
 
 const sessionSchema = new mongoose.Schema({
@@ -135,8 +137,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check
-// App calls: httpGet("/api/health")?.optString("status") == "OK"
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -147,27 +147,23 @@ app.get('/api/health', (req, res) => {
 });
 
 // ==================== USER ROUTES ====================
-// CRITICAL FIX: /api/user/by-trackid/:trackId MUST be registered BEFORE /api/user/:uid
-// Express matches routes top-to-bottom. If /api/user/:uid comes first, the string
-// "by-trackid" gets captured as uid and the by-trackid route is NEVER reached.
-// This was breaking the entire "Add Friend" / profile lookup flow.
+// CRITICAL: by-trackid MUST be before /:uid
 
-// GET /api/user/by-trackid/:trackId  — look up public profile by Track ID
-// App calls: httpGet("/api/user/by-trackid/$normalized")
-// App reads: j.getString("trackId"), j.optString("displayName"), j.optString("email")
+// GET /api/user/by-trackid/:trackId
 app.get('/api/user/by-trackid/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
     const user = await User.findOne({ trackId: trackId.trim().toUpperCase() })
-      || await User.findOne({ trackId });   // fallback without normalising in case stored as-is
+      || await User.findOne({ trackId });
     if (!user) {
       return res.status(404).json({ error: 'No user found for this Track ID' });
     }
     res.json({
-      uid:         user.uid,
-      trackId:     user.trackId,
-      displayName: user.displayName,
-      email:       user.email
+      uid:          user.uid,
+      trackId:      user.trackId,
+      displayName:  user.displayName,
+      email:        user.email,
+      avatarBase64: user.avatarBase64 || ''
     });
   } catch (error) {
     console.error('Error fetching user by trackId:', error);
@@ -175,9 +171,7 @@ app.get('/api/user/by-trackid/:trackId', async (req, res) => {
   }
 });
 
-// GET /api/user/:uid  — fetch full user doc
-// App calls: httpGet("/api/user/${user.uid}")
-// App reads: userDoc.getString("trackId"), optJSONArray("friends"), optJSONArray("savedFriends")
+// GET /api/user/:uid
 app.get('/api/user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
@@ -190,6 +184,7 @@ app.get('/api/user/:uid', async (req, res) => {
       trackId:      user.trackId,
       displayName:  user.displayName,
       email:        user.email,
+      avatarBase64: user.avatarBase64 || '',
       friends:      user.friends,
       savedFriends: user.savedFriends || []
     });
@@ -199,8 +194,7 @@ app.get('/api/user/:uid', async (req, res) => {
   }
 });
 
-// POST /api/user/upsert  — create or update user on login
-// App sends: {uid, trackId, displayName, email}
+// POST /api/user/upsert
 app.post('/api/user/upsert', async (req, res) => {
   try {
     const { uid, trackId, displayName, email } = req.body;
@@ -214,7 +208,6 @@ app.post('/api/user/upsert', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // Ensure a location document exists so friends can query it
     await Location.findOneAndUpdate(
       { trackId },
       { $setOnInsert: { trackId, lat: 0, lng: 0, isActive: false } },
@@ -229,8 +222,30 @@ app.post('/api/user/upsert', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/friends  — overwrite live-tracking list
-// App sends: {friends: [trackId, ...]}
+// POST /api/user/:uid/avatar  — save profile picture base64
+// App calls: httpPost("/api/user/${user.uid}/avatar", {avatarBase64: b64})
+app.post('/api/user/:uid/avatar', async (req, res) => {
+  try {
+    const { uid }          = req.params;
+    const { avatarBase64 } = req.body;
+    if (!avatarBase64) return res.status(400).json({ error: 'avatarBase64 required' });
+
+    const user = await User.findOneAndUpdate(
+      { uid },
+      { avatarBase64, updatedAt: new Date() },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    console.log(`🖼 Avatar updated for ${uid}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error saving avatar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/user/:uid/friends
 app.post('/api/user/:uid/friends', async (req, res) => {
   try {
     const { uid }     = req.params;
@@ -250,8 +265,7 @@ app.post('/api/user/:uid/friends', async (req, res) => {
   }
 });
 
-// POST /api/user/:uid/saved-friends  — overwrite saved friends (rich objects)
-// App sends: {savedFriends: [{trackId, displayName, email}, ...]}
+// POST /api/user/:uid/saved-friends
 app.post('/api/user/:uid/saved-friends', async (req, res) => {
   try {
     const { uid }          = req.params;
@@ -273,8 +287,6 @@ app.post('/api/user/:uid/saved-friends', async (req, res) => {
 
 // ==================== TRACK ID ROUTES ====================
 
-// POST /api/track/generate
-// App reads: optString("trackId")
 app.post('/api/track/generate', async (req, res) => {
   try {
     let trackId, exists = true;
@@ -293,7 +305,11 @@ app.post('/api/track/generate', async (req, res) => {
 // ==================== LOCATION ROUTES ====================
 
 // POST /api/location/update
-// App sends: {trackId, lat, lng, accuracy, speed}
+// ── isRecent threshold: 8 seconds (was 60 s).
+//    With 800 ms push intervals, any fix older than 8 s means the user has
+//    gone offline or the network is very slow — mark them as not-recent.
+const IS_RECENT_MS = 8_000;
+
 app.post('/api/location/update', async (req, res) => {
   try {
     const { trackId, lat, lng, speed, accuracy } = req.body;
@@ -304,27 +320,37 @@ app.post('/api/location/update', async (req, res) => {
       return res.status(400).json({ error: 'Invalid coordinates' });
     }
 
+    const now = new Date();
     const location = await Location.findOneAndUpdate(
       { trackId },
-      { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: new Date(), isActive: true },
+      { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true },
       { upsert: true, new: true }
     );
 
-    await PathHistory.findOneAndUpdate(
+    // Append to path history — fire and forget so we don't slow down the response
+    PathHistory.findOneAndUpdate(
       { trackId },
       {
-        $push: { points: { $each: [{ lat, lng, timestamp: new Date() }], $slice: -1000 } },
-        lastUpdated: new Date()
+        $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } },
+        lastUpdated: now
       },
-      { upsert: true, new: true }
-    );
+      { upsert: true }
+    ).catch(() => {});
 
-    const updateData = { trackId, lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: new Date() };
-    io.emit('location:updated', updateData);
+    const updateData = {
+      trackId, lat, lng,
+      speed:     speed    || 0,
+      accuracy:  accuracy || 0,
+      timestamp: now,
+      isRecent:  true
+    };
+
+    // Broadcast immediately to all sockets tracking this person
     io.to(`track:${trackId}`).emit('location:updated', updateData);
+    // Also broadcast globally so any clients that haven't subscribed still get it
+    io.emit('location:updated', updateData);
 
-    console.log(`📍 Location updated for ${trackId}`);
-    res.json({ success: true, location });
+    res.json({ success: true });
   } catch (error) {
     console.error('Error updating location:', error);
     res.status(500).json({ error: error.message });
@@ -332,8 +358,6 @@ app.post('/api/location/update', async (req, res) => {
 });
 
 // GET /api/location/:trackId
-// App reads: j.optDouble("lat"), j.optDouble("lng"), j.optDouble("accuracy"),
-//            j.optDouble("speed"), j.optBoolean("isRecent")
 app.get('/api/location/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -344,7 +368,8 @@ app.get('/api/location/:trackId', async (req, res) => {
       return res.json({ trackId, isRecent: false, notFound: true });
     }
 
-    const isRecent = location.timestamp > new Date(Date.now() - 60000);
+    // isRecent: last update within 8 seconds
+    const isRecent = location.timestamp > new Date(Date.now() - IS_RECENT_MS);
     res.json({
       trackId:   location.trackId,
       lat:       location.lat,
@@ -361,7 +386,6 @@ app.get('/api/location/:trackId', async (req, res) => {
   }
 });
 
-// GET /api/path/:trackId
 app.get('/api/path/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -377,7 +401,6 @@ app.get('/api/path/:trackId', async (req, res) => {
   }
 });
 
-// POST /api/location/deactivate/:trackId
 app.post('/api/location/deactivate/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -392,8 +415,6 @@ app.post('/api/location/deactivate/:trackId', async (req, res) => {
 
 // ==================== SESSION ROUTES ====================
 
-// POST /api/session/start
-// App sends: {sessionId, uid, trackId, startTime}
 app.post('/api/session/start', async (req, res) => {
   try {
     const { sessionId, uid, trackId, startTime } = req.body;
@@ -414,8 +435,6 @@ app.post('/api/session/start', async (req, res) => {
   }
 });
 
-// POST /api/session/:sessionId/point
-// App sends: {lat, lng}
 app.post('/api/session/:sessionId/point', async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -434,8 +453,6 @@ app.post('/api/session/:sessionId/point', async (req, res) => {
   }
 });
 
-// PATCH /api/session/:sessionId/end
-// App sends: {endTime}
 app.patch('/api/session/:sessionId/end', async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -452,7 +469,6 @@ app.patch('/api/session/:sessionId/end', async (req, res) => {
   }
 });
 
-// GET /api/session/:uid/list
 app.get('/api/session/:uid/list', async (req, res) => {
   try {
     const { uid } = req.params;
@@ -495,18 +511,6 @@ app.post('/api/cleanup', async (req, res) => {
 
 // ==================== CHAT ROUTES ====================
 
-// POST /api/chat/send
-// App sends: {conversationId, senderId, senderName, receiverId, receiverName, text}
-// App checks: result != null (httpPost returns null on failure)
-//
-// CRITICAL FIX: Removed MongoDB transactions. Transactions require a replica set
-// (MongoDB Atlas M10+). Atlas M0/M2/M5 free/shared clusters do NOT support
-// transactions — withTransaction() throws "Transaction numbers are only allowed
-// on a replica member or mongos" and the entire route crashes with 500, making
-// every single message send fail silently on the client (httpPost returns null,
-// pendingMessage is removed, inputText is restored but looks like a send error).
-// Using sequential awaits instead — if the second write fails the client retries
-// anyway because it polls messages every 1.5 s.
 app.post('/api/chat/send', async (req, res) => {
   try {
     const { conversationId, senderId, senderName, receiverId, receiverName, text } = req.body;
@@ -517,17 +521,15 @@ app.post('/api/chat/send', async (req, res) => {
 
     const ts = Date.now();
 
-    // 1. Save the message
     const savedMessage = await Message.create({
       conversationId,
       senderId,
       senderName,
       text,
       timestamp: ts,
-      readBy:    [senderId]   // sender has already "read" their own message
+      readBy:    [senderId]
     });
 
-    // 2. Upsert the conversation summary
     await Conversation.findOneAndUpdate(
       { conversationId },
       {
@@ -544,7 +546,6 @@ app.post('/api/chat/send', async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // 3. Broadcast via Socket.IO so both devices update immediately
     const payload = {
       _id:            savedMessage._id.toString(),
       conversationId,
@@ -555,10 +556,7 @@ app.post('/api/chat/send', async (req, res) => {
       readBy:         [senderId]
     };
 
-    // Emit to the conversation room (both devices if they joined it)
     io.to(`conversation:${conversationId}`).emit('chat:message', payload);
-    // Also emit to each participant's personal room — catches devices on
-    // the chat LIST screen that haven't joined the conversation room yet
     io.to(`user:${receiverId}`).emit('chat:newMessage', payload);
     io.to(`user:${senderId}`).emit('chat:message', payload);
 
@@ -571,9 +569,6 @@ app.post('/api/chat/send', async (req, res) => {
   }
 });
 
-// GET /api/chat/conversations/:trackId
-// App calls every 3 s (ChatListScreen) and every 2.5 s (notification loop in MainApp)
-// App reads: conversationId, participants[], names{}, lastMessage, lastTimestamp, unread{}
 app.get('/api/chat/conversations/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -592,9 +587,6 @@ app.get('/api/chat/conversations/:trackId', async (req, res) => {
   }
 });
 
-// GET /api/chat/messages/:conversationId
-// App calls every 1.5 s (ChatConversationScreen)
-// App reads: _id, conversationId, senderId, senderName, text, timestamp, readBy[]
 app.get('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
@@ -616,9 +608,6 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
   }
 });
 
-// POST /api/chat/read
-// App sends: {conversationId, trackId}
-// Called when the user opens a conversation
 app.post('/api/chat/read', async (req, res) => {
   try {
     const { conversationId, trackId } = req.body;
@@ -626,19 +615,16 @@ app.post('/api/chat/read', async (req, res) => {
       return res.status(400).json({ error: 'conversationId and trackId required' });
     }
 
-    // Reset unread counter for this user
     await Conversation.findOneAndUpdate(
       { conversationId },
       { $set: { [`unread.${trackId}`]: 0 } }
     );
 
-    // Mark all messages in this conversation as read by this user
     await Message.updateMany(
       { conversationId, readBy: { $ne: trackId } },
       { $addToSet: { readBy: trackId } }
     );
 
-    // Push read receipt via socket so sender's tick turns green immediately
     io.to(`conversation:${conversationId}`).emit('chat:read', { conversationId, readBy: trackId });
     io.to(`user:${trackId}`).emit('chat:read', { conversationId, readBy: trackId });
 
@@ -649,9 +635,6 @@ app.post('/api/chat/read', async (req, res) => {
   }
 });
 
-// DELETE /api/chat/message/:messageId  — delete for everyone (sender only, enforced client-side)
-// App calls: httpDeleteReturningOk("/api/chat/message/${msg.id}")
-// msg.id comes from parseMessages which reads o.optString("_id") — so it's the MongoDB ObjectId string
 app.delete('/api/chat/message/:messageId', async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -662,14 +645,12 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
 
     const message = await Message.findById(messageId);
     if (!message) {
-      // Already deleted — return success so client UI stays in sync
       return res.json({ ok: true, alreadyDeleted: true });
     }
 
     const { conversationId } = message;
     await Message.deleteOne({ _id: messageId });
 
-    // Update conversation's lastMessage preview if this was the latest message
     const latestMsg = await Message.findOne({ conversationId }).sort({ timestamp: -1 });
     await Conversation.findOneAndUpdate(
       { conversationId },
@@ -679,8 +660,6 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
       }
     );
 
-    // Broadcast deletion so the other device removes the bubble on its next poll
-    // (or immediately if it's in the conversation room)
     io.to(`conversation:${conversationId}`).emit('chat:messageDeleted', { messageId, conversationId });
     console.log(`🗑 Message deleted for everyone: ${messageId}`);
     res.json({ ok: true });
@@ -690,8 +669,6 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
   }
 });
 
-// DELETE /api/chat/messages/:conversationId  — clear entire chat
-// App calls: httpDeleteReturningOk("/api/chat/messages/$conversationId")
 app.delete('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
@@ -714,7 +691,6 @@ app.delete('/api/chat/messages/:conversationId', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('👤 Socket connected:', socket.id);
 
-  // track:subscribe / track:unsubscribe — used for live location updates
   socket.on('track:subscribe', (trackId) => {
     socket.join(`track:${trackId}`);
     socket.emit('track:subscribed', { trackId, success: true });
@@ -724,16 +700,12 @@ io.on('connection', (socket) => {
     socket.leave(`track:${trackId}`);
   });
 
-  // user:join — app should call this immediately after auth with myTrackId.
-  // Joining the personal room ensures chat events (new messages, deletions,
-  // read receipts) arrive even when the user is NOT inside a conversation screen.
   socket.on('user:join', (trackId) => {
     socket.join(`user:${trackId}`);
     socket.emit('user:joined', { trackId, success: true });
     console.log(`👤 ${trackId} joined personal room`);
   });
 
-  // conversation:join / leave — called when a conversation screen is opened/closed
   socket.on('conversation:join', (conversationId) => {
     socket.join(`conversation:${conversationId}`);
     socket.emit('conversation:joined', { conversationId, success: true });
@@ -743,30 +715,34 @@ io.on('connection', (socket) => {
     socket.leave(`conversation:${conversationId}`);
   });
 
-  // location:update via socket (background service path)
   socket.on('location:update', async (data) => {
     try {
       const { trackId, lat, lng, speed, accuracy } = data;
       if (!trackId || lat === undefined || lng === undefined) return;
 
+      const now = new Date();
       await Location.findOneAndUpdate(
         { trackId },
-        { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: new Date(), isActive: true },
+        { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true },
         { upsert: true, new: true }
       );
 
-      await PathHistory.findOneAndUpdate(
+      PathHistory.findOneAndUpdate(
         { trackId },
         {
-          $push: { points: { $each: [{ lat, lng, timestamp: new Date() }], $slice: -1000 } },
-          lastUpdated: new Date()
+          $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } },
+          lastUpdated: now
         },
         { upsert: true }
-      );
+      ).catch(() => {});
 
-      const updateData = { trackId, lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: new Date() };
-      io.emit('location:updated', updateData);
+      const updateData = {
+        trackId, lat, lng,
+        speed: speed || 0, accuracy: accuracy || 0,
+        timestamp: now, isRecent: true
+      };
       io.to(`track:${trackId}`).emit('location:updated', updateData);
+      io.emit('location:updated', updateData);
     } catch (error) {
       console.error('Socket location update error:', error);
       socket.emit('error', { message: error.message });
