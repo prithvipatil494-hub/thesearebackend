@@ -27,8 +27,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Raise body size limit to 10 MB to accommodate base64 image payloads
-app.use(express.json({ limit: '10mb' }));
+// Raise body size limit to 50 MB to accommodate base64 video payloads
+app.use(express.json({ limit: '50mb' }));
 
 const MONGODB_URI = process.env.MONGODB_URI || 'your_mongodb_connection_string_here';
 
@@ -75,9 +75,10 @@ const messageSchema = new mongoose.Schema({
   text:           String,
   timestamp:      { type: Number, default: () => Date.now() },
   readBy:         { type: [String], default: [] },
-  // Photo sharing fields
-  type:           { type: String, default: 'text', enum: ['text', 'image'] },
-  imageBase64:    { type: String, default: '' }   // base64-encoded JPEG, max ~750 KB
+  // Photo / video sharing fields
+  type:           { type: String, default: 'text', enum: ['text', 'image', 'video'] },
+  imageBase64:    { type: String, default: '' },  // base64 JPEG (image) or MP4 (video)
+  videoDelivered: { type: Boolean, default: false }  // set true once video fetched by receiver
 });
 messageSchema.index({ conversationId: 1, timestamp: 1 });
 messageSchema.index({ conversationId: 1, readBy: 1 });
@@ -125,12 +126,23 @@ const sessionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+const sosAlertSchema = new mongoose.Schema({
+  senderTrackId: { type: String, required: true, index: true },
+  displayName:   { type: String, default: '' },
+  lat:           { type: Number, default: 0 },
+  lng:           { type: Number, default: 0 },
+  videoBase64:   { type: String, default: '' },
+  timestamp:     { type: Date, default: Date.now },
+  expiresAt:     { type: Date, default: () => new Date(Date.now() + 4 * 60 * 60 * 1000) }
+});
+
 const Location     = mongoose.model('Location',     locationSchema);
 const PathHistory  = mongoose.model('PathHistory',  pathHistorySchema);
 const Message      = mongoose.model('Message',      messageSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
 const User         = mongoose.model('User',         userSchema);
 const Session      = mongoose.model('Session',      sessionSchema);
+const SosAlert     = mongoose.model('SosAlert',     sosAlertSchema);
 
 // ==================== REST API ROUTES ====================
 
@@ -583,6 +595,73 @@ io.on('connection', (socket) => {
   socket.on('ping', () => socket.emit('pong', { timestamp: new Date() }));
   socket.on('disconnect', (reason) => console.log('👤 Disconnected:', socket.id, reason));
   socket.on('error', (error) => console.error('Socket error:', error));
+});
+
+// POST /api/chat/video-delivered/:msgId — clear video payload after receiver saves it locally
+app.post('/api/chat/video-delivered/:msgId', async (req, res) => {
+  try {
+    const { msgId } = req.params;
+    await Message.findByIdAndUpdate(msgId, { imageBase64: '', videoDelivered: true });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==================== SOS ROUTES ====================
+
+// POST /api/sos — broadcast SOS from a user to all their watchers
+app.post('/api/sos', async (req, res) => {
+  try {
+    const { trackId, displayName, lat, lng } = req.body;
+    if (!trackId) return res.status(400).json({ error: 'trackId required' });
+    // Persist so contacts can poll it
+    await SosAlert.findOneAndUpdate(
+      { senderTrackId: trackId },
+      { senderTrackId: trackId, displayName: displayName || trackId, lat: lat || 0, lng: lng || 0,
+        videoBase64: '', timestamp: new Date(),
+        expiresAt: new Date(Date.now() + 4 * 60 * 60 * 1000) },
+      { upsert: true, new: true }
+    );
+    // Real-time push to any socket watchers
+    io.to(`track:${trackId}`).emit('sos_alert', { trackId, displayName: displayName || trackId, lat, lng, timestamp: new Date() });
+    console.log(`🚨 SOS from ${trackId}`);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/sos/video/:trackId — attach video to existing SOS alert
+app.post('/api/sos/video/:trackId', async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    const { videoBase64 } = req.body;
+    if (!videoBase64) return res.status(400).json({ error: 'videoBase64 required' });
+    await SosAlert.findOneAndUpdate({ senderTrackId: trackId }, { videoBase64 });
+    io.to(`track:${trackId}`).emit('sos_video', { trackId, videoBase64 });
+    console.log(`🎥 SOS video uploaded by ${trackId}`);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/sos/pending/:myTrackId — return active SOS alerts from contacts tracking myTrackId
+app.get('/api/sos/pending/:myTrackId', async (req, res) => {
+  try {
+    const { myTrackId } = req.params;
+    // Find all users who have myTrackId in their friends list
+    const watchers = await User.find({ friends: myTrackId }).select('trackId').lean();
+    const watcherTrackIds = watchers.map(w => w.trackId);
+    const now = new Date();
+    const alerts = await SosAlert.find({
+      senderTrackId: { $in: watcherTrackIds },
+      expiresAt: { $gt: now }
+    }).lean();
+    res.json(alerts.map(a => ({
+      trackId: a.senderTrackId,
+      displayName: a.displayName,
+      lat: a.lat,
+      lng: a.lng,
+      videoBase64: a.videoBase64,
+      timestamp: a.timestamp
+    })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==================== AUTO CLEANUP (hourly) ====================
