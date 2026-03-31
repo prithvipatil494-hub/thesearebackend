@@ -484,7 +484,13 @@ app.get('/api/chat/conversations/:trackId', async (req, res) => {
 app.get('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
-    const msgs = await Message.find({ conversationId }).sort({ timestamp: 1 }).limit(200);
+    const { since } = req.query;  // optional: only return messages newer than this timestamp
+    const query = { conversationId };
+    if (since) {
+      const sinceTs = parseInt(since, 10);
+      if (!isNaN(sinceTs)) query.timestamp = { $gt: sinceTs };
+    }
+    const msgs = await Message.find(query).sort({ timestamp: 1 }).limit(200);
     res.json(msgs.map(m => ({
       _id:            m._id.toString(),
       conversationId: m.conversationId,
