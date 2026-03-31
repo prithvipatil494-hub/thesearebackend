@@ -42,13 +42,14 @@ mongoose.connect(MONGODB_URI, {
 // ==================== MONGOOSE SCHEMAS ====================
 
 const locationSchema = new mongoose.Schema({
-  trackId:   { type: String, required: true, unique: true, index: true },
-  lat:       { type: Number, required: true },
-  lng:       { type: Number, required: true },
-  speed:     { type: Number, default: 0 },
-  accuracy:  { type: Number, default: 0 },
-  timestamp: { type: Date, default: Date.now },
-  isActive:  { type: Boolean, default: true }
+  trackId:         { type: String, required: true, unique: true, index: true },
+  lat:             { type: Number, default: 0 },
+  lng:             { type: Number, default: 0 },
+  speed:           { type: Number, default: 0 },
+  accuracy:        { type: Number, default: 0 },
+  timestamp:       { type: Date, default: Date.now },
+  isActive:        { type: Boolean, default: true },
+  encryptedCoords: { type: String, default: '' }  // AES-256-GCM encrypted "lat,lng"
 });
 
 const pathHistorySchema = new mongoose.Schema({
@@ -262,15 +263,26 @@ const IS_RECENT_MS = 8_000;
 
 app.post('/api/location/update', async (req, res) => {
   try {
-    const { trackId, lat, lng, speed, accuracy } = req.body;
-    if (!trackId || lat === undefined || lng === undefined) return res.status(400).json({ error: 'Missing required fields: trackId, lat, lng' });
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return res.status(400).json({ error: 'Invalid coordinates' });
+    const { trackId, lat, lng, speed, accuracy, encryptedCoords } = req.body;
+    if (!trackId) return res.status(400).json({ error: 'Missing required field: trackId' });
+
+    // When the client sends encryptedCoords, store it and zero out raw lat/lng so
+    // the actual position is never stored in plaintext on the server.
+    const hasEncrypted = encryptedCoords && encryptedCoords.length > 0;
+    const storeLat = hasEncrypted ? 0 : (lat || 0);
+    const storeLng = hasEncrypted ? 0 : (lng || 0);
+    if (!hasEncrypted && (lat === undefined || lng === undefined)) return res.status(400).json({ error: 'Missing required fields: lat, lng (or encryptedCoords)' });
+    if (!hasEncrypted && (lat < -90 || lat > 90 || lng < -180 || lng > 180)) return res.status(400).json({ error: 'Invalid coordinates' });
 
     const now = new Date();
-    await Location.findOneAndUpdate({ trackId }, { lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true }, { upsert: true, new: true });
-    PathHistory.findOneAndUpdate({ trackId }, { $push: { points: { $each: [{ lat, lng, timestamp: now }], $slice: -1000 } }, lastUpdated: now }, { upsert: true }).catch(() => {});
+    await Location.findOneAndUpdate(
+      { trackId },
+      { lat: storeLat, lng: storeLng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isActive: true, encryptedCoords: encryptedCoords || '' },
+      { upsert: true, new: true }
+    );
+    PathHistory.findOneAndUpdate({ trackId }, { $push: { points: { $each: [{ lat: storeLat, lng: storeLng, timestamp: now }], $slice: -1000 } }, lastUpdated: now }, { upsert: true }).catch(() => {});
 
-    const updateData = { trackId, lat, lng, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isRecent: true };
+    const updateData = { trackId, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isRecent: true, encryptedCoords: encryptedCoords || '' };
     io.to(`track:${trackId}`).emit('location:updated', updateData);
     io.emit('location:updated', updateData);
     res.json({ success: true });
@@ -287,7 +299,7 @@ app.get('/api/location/:trackId', async (req, res) => {
     const location = await Location.findOne({ trackId });
     if (!location) return res.json({ trackId, isRecent: false, notFound: true });
     const isRecent = location.timestamp > new Date(Date.now() - IS_RECENT_MS);
-    res.json({ trackId: location.trackId, lat: location.lat, lng: location.lng, speed: location.speed, accuracy: location.accuracy, timestamp: location.timestamp, isActive: location.isActive, isRecent });
+    res.json({ trackId: location.trackId, lat: location.lat, lng: location.lng, speed: location.speed, accuracy: location.accuracy, timestamp: location.timestamp, isActive: location.isActive, isRecent, encryptedCoords: location.encryptedCoords || '' });
   } catch (error) {
     console.error('Error fetching location:', error);
     res.status(500).json({ error: error.message });
