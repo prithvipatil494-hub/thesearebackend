@@ -109,6 +109,8 @@ const userSchema = new mongoose.Schema({
     }],
     default: []
   },
+  blockedUsers: { type: [String], default: [] },  // Users this user has blocked
+  blockedBy:    { type: [String], default: [] },  // Users who have blocked this user
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -282,9 +284,23 @@ app.post('/api/location/update', async (req, res) => {
     );
     PathHistory.findOneAndUpdate({ trackId }, { $push: { points: { $each: [{ lat: storeLat, lng: storeLng, timestamp: now }], $slice: -1000 } }, lastUpdated: now }, { upsert: true }).catch(() => {});
 
+    // Get user info to check who has blocked this user
+    const user = await User.findOne({ trackId });
+    const blockedBy = user?.blockedBy || [];
+
     const updateData = { trackId, speed: speed || 0, accuracy: accuracy || 0, timestamp: now, isRecent: true, encryptedCoords: encryptedCoords || '' };
+    
+    // Send location to track subscribers, but exclude users who have blocked this user
     io.to(`track:${trackId}`).emit('location:updated', updateData);
+    
+    // Also emit globally, but clients will need to filter out blocked users
     io.emit('location:updated', updateData);
+    
+    // Log if user is being blocked by anyone
+    if (blockedBy.length > 0) {
+      console.log(`🚫 Location update for ${trackId} - blocked by: [${blockedBy.join(', ')}]`);
+    }
+    
     res.json({ success: true });
   } catch (error) {
     console.error('Error updating location:', error);
@@ -403,6 +419,84 @@ app.post('/api/cleanup', async (req, res) => {
     const [dl, dp] = await Promise.all([Location.deleteMany({ timestamp: { $lt: cutoff } }), PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })]);
     res.json({ success: true, deletedLocations: dl.deletedCount, deletedPaths: dp.deletedCount });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== USER BLOCKING ROUTES ====================
+
+// POST /api/users/block - Block a user
+app.post('/api/users/block', async (req, res) => {
+  try {
+    const { myId, targetId } = req.body;
+    if (!myId || !targetId) return res.status(400).json({ error: 'myId and targetId are required' });
+    
+    console.log(`🚫 Block request: ${myId} blocking ${targetId}`);
+    
+    // Update blocker's blocked list
+    await User.findOneAndUpdate(
+      { uid: myId },
+      { $addToSet: { blockedUsers: targetId } },
+      { upsert: true }
+    );
+    
+    // Also update the target's blockedBy list for reverse lookup
+    await User.findOneAndUpdate(
+      { uid: targetId },
+      { $addToSet: { blockedBy: myId } },
+      { upsert: true }
+    );
+    
+    // Notify via socket that blocking occurred
+    io.to(`user:${targetId}`).emit('user:blocked', { blockedBy: myId });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error blocking user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/users/unblock - Unblock a user
+app.post('/api/users/unblock', async (req, res) => {
+  try {
+    const { myId, targetId } = req.body;
+    if (!myId || !targetId) return res.status(400).json({ error: 'myId and targetId are required' });
+    
+    console.log(`✅ Unblock request: ${myId} unblocking ${targetId}`);
+    
+    // Remove from blocker's blocked list
+    await User.findOneAndUpdate(
+      { uid: myId },
+      { $pull: { blockedUsers: targetId } }
+    );
+    
+    // Remove from target's blockedBy list
+    await User.findOneAndUpdate(
+      { uid: targetId },
+      { $pull: { blockedBy: myId } }
+    );
+    
+    // Notify via socket that unblocking occurred
+    io.to(`user:${targetId}`).emit('user:unblocked', { unblockedBy: myId });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error unblocking user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/users/blocked/:uid - Get list of users blocked by this user
+app.get('/api/users/blocked/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const user = await User.findOne({ uid });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    
+    res.json({ blockedUsers: user.blockedUsers || [] });
+  } catch (error) {
+    console.error('Error getting blocked users:', error);
     res.status(500).json({ error: error.message });
   }
 });
