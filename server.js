@@ -425,79 +425,88 @@ app.post('/api/cleanup', async (req, res) => {
 
 // ==================== USER BLOCKING ROUTES ====================
 
-// POST /api/users/block - Block a user
+// POST /api/users/block
 app.post('/api/users/block', async (req, res) => {
   try {
-    const { myId, targetId } = req.body;
-    if (!myId || !targetId) return res.status(400).json({ error: 'myId and targetId are required' });
-    
-    console.log(`🚫 Block request: ${myId} blocking ${targetId}`);
-    
-    // Update blocker's blocked list
+    const { myTrackId, targetTrackId } = req.body;
+    if (!myTrackId || !targetTrackId) 
+      return res.status(400).json({ error: 'myTrackId and targetTrackId are required' });
+
+    // Add targetTrackId to blocker's blocked list
     await User.findOneAndUpdate(
-      { uid: myId },
-      { $addToSet: { blockedUsers: targetId } },
-      { upsert: true }
+      { trackId: myTrackId },
+      { $addToSet: { blockedUsers: targetTrackId } }
     );
-    
-    // Also update the target's blockedBy list for reverse lookup
+    // Add myTrackId to target's blockedBy list (reverse lookup)
     await User.findOneAndUpdate(
-      { uid: targetId },
-      { $addToSet: { blockedBy: myId } },
-      { upsert: true }
+      { trackId: targetTrackId },
+      { $addToSet: { blockedBy: myTrackId } }
     );
-    
-    // Notify via socket that blocking occurred
-    io.to(`user:${targetId}`).emit('user:blocked', { blockedBy: myId });
-    
+
+    // Notify target via socket so their app reacts instantly
+    io.to(`user:${targetTrackId}`).emit('user:blocked', { blockedBy: myTrackId });
+
+    console.log(`🚫 ${myTrackId} blocked ${targetTrackId}`);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Error blocking user:', error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error('Error blocking user:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/users/unblock - Unblock a user
+// POST /api/users/unblock
 app.post('/api/users/unblock', async (req, res) => {
   try {
-    const { myId, targetId } = req.body;
-    if (!myId || !targetId) return res.status(400).json({ error: 'myId and targetId are required' });
-    
-    console.log(`✅ Unblock request: ${myId} unblocking ${targetId}`);
-    
-    // Remove from blocker's blocked list
+    const { myTrackId, targetTrackId } = req.body;
+    if (!myTrackId || !targetTrackId)
+      return res.status(400).json({ error: 'myTrackId and targetTrackId are required' });
+
     await User.findOneAndUpdate(
-      { uid: myId },
-      { $pull: { blockedUsers: targetId } }
+      { trackId: myTrackId },
+      { $pull: { blockedUsers: targetTrackId } }
     );
-    
-    // Remove from target's blockedBy list
     await User.findOneAndUpdate(
-      { uid: targetId },
-      { $pull: { blockedBy: myId } }
+      { trackId: targetTrackId },
+      { $pull: { blockedBy: myTrackId } }
     );
-    
-    // Notify via socket that unblocking occurred
-    io.to(`user:${targetId}`).emit('user:unblocked', { unblockedBy: myId });
-    
+
+    io.to(`user:${targetTrackId}`).emit('user:unblocked', { unblockedBy: myTrackId });
+
+    console.log(`✅ ${myTrackId} unblocked ${targetTrackId}`);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Error unblocking user:', error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error('Error unblocking user:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/users/blocked/:uid - Get list of users blocked by this user
-app.get('/api/users/blocked/:uid', async (req, res) => {
+// GET /api/users/blocked/:trackId — returns full display info for each blocked user
+app.get('/api/users/blocked/:trackId', async (req, res) => {
   try {
-    const { uid } = req.params;
-    const user = await User.findOne({ uid });
+    const { trackId } = req.params;
+    const user = await User.findOne({ trackId });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    
-    res.json({ blockedUsers: user.blockedUsers || [] });
-  } catch (error) {
-    console.error('Error getting blocked users:', error);
-    res.status(500).json({ error: error.message });
+
+    const blockedTrackIds = user.blockedUsers || [];
+    if (blockedTrackIds.length === 0) return res.json({ blockedUsers: [] });
+
+    // Fetch display info for each blocked user
+    const blockedUsers = await User.find(
+      { trackId: { $in: blockedTrackIds } },
+      'trackId displayName email avatarBase64'
+    ).lean();
+
+    res.json({
+      blockedUsers: blockedUsers.map(u => ({
+        trackId:      u.trackId,
+        displayName:  u.displayName || u.trackId,
+        email:        u.email       || '',
+        avatarBase64: u.avatarBase64 || ''
+      }))
+    });
+  } catch (err) {
+    console.error('Error fetching blocked users:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -512,6 +521,18 @@ app.post('/api/chat/send', async (req, res) => {
 
     if (!conversationId || !senderId || !receiverId) {
       return res.status(400).json({ error: 'Missing required fields: conversationId, senderId, receiverId' });
+    }
+
+    // Check if either user has blocked the other
+    const [senderUser, receiverUser] = await Promise.all([
+      User.findOne({ trackId: senderId }, 'blockedUsers blockedBy').lean(),
+      User.findOne({ trackId: receiverId }, 'blockedUsers blockedBy').lean()
+    ]);
+    const senderBlocked   = senderUser?.blockedUsers?.includes(receiverId) || false;
+    const receiverBlocked = receiverUser?.blockedUsers?.includes(senderId)  || false;
+
+    if (senderBlocked || receiverBlocked) {
+      return res.status(403).json({ error: 'Message blocked', blocked: true });
     }
 
     const msgType = (type === 'image') ? 'image' : 'text';
