@@ -94,23 +94,25 @@ const conversationSchema = new mongoose.Schema({
 });
 
 const userSchema = new mongoose.Schema({
-  uid:          { type: String, required: true, unique: true, index: true },
-  trackId:      { type: String, required: true, index: true },
-  displayName:  { type: String, default: '' },
-  email:        { type: String, default: '' },
+  uid: { type: String, required: true, unique: true, index: true },
+  trackId: { type: String, required: true, index: true },
+  displayName: { type: String, default: '' },
+  email: { type: String, default: '' },
   avatarBase64: { type: String, default: '' },
-  friends:      { type: [String], default: [] },
+  friends: { type: [String], default: [] },
   savedFriends: {
     type: [{
-      trackId:      String,
-      displayName:  String,
-      email:        String,
+      trackId: String,
+      displayName: String,
+      email: String,
       avatarBase64: String
     }],
     default: []
   },
   blockedUsers: { type: [String], default: [] },  // Users this user has blocked
-  blockedBy:    { type: [String], default: [] },  // Users who have blocked this user
+  blockedBy: { type: [String], default: [] },  // Users who have blocked this user
+  privacyMode: { type: String, default: 'EVERYONE', enum: ['EVERYONE', 'CONTACTS_ONLY', 'SELECTED'] },
+  approvedIds: { type: [String], default: [] },  // Explicit allow-list for SELECTED mode
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -310,12 +312,51 @@ app.post('/api/location/update', async (req, res) => {
 
 app.get('/api/location/:trackId', async (req, res) => {
   try {
-    const { trackId } = req.params;
+    const { trackId }   = req.params;
+    const { requesterId } = req.query;   // optional — Android sends this
+
     if (!trackId) return res.status(400).json({ error: 'Track ID is required' });
+
     const location = await Location.findOne({ trackId });
     if (!location) return res.json({ trackId, isRecent: false, notFound: true });
+
+    // ── Privacy check ──────────────────────────────────────────────────────
+    if (requesterId && requesterId !== trackId) {
+      const owner = await User.findOne({ trackId }, 'privacyMode approvedIds friends blockedUsers').lean();
+      if (owner) {
+        const mode      = owner.privacyMode || 'EVERYONE';
+        const blocked   = owner.blockedUsers || [];
+        const approved  = owner.approvedIds  || [];
+        const friends   = owner.friends      || [];
+
+        // Block takes priority
+        if (blocked.includes(requesterId)) {
+          return res.status(403).json({ error: 'blocked', notFound: true });
+        }
+
+        if (mode === 'CONTACTS_ONLY' && !friends.includes(requesterId)) {
+          return res.status(403).json({ error: 'privacy', notFound: true });
+        }
+
+        if (mode === 'SELECTED' && !approved.includes(requesterId)) {
+          return res.status(403).json({ error: 'privacy', notFound: true });
+        }
+      }
+    }
+    // ── End privacy check ──────────────────────────────────────────────────
+
     const isRecent = location.timestamp > new Date(Date.now() - IS_RECENT_MS);
-    res.json({ trackId: location.trackId, lat: location.lat, lng: location.lng, speed: location.speed, accuracy: location.accuracy, timestamp: location.timestamp, isActive: location.isActive, isRecent, encryptedCoords: location.encryptedCoords || '' });
+    res.json({
+      trackId:         location.trackId,
+      lat:             location.lat,
+      lng:             location.lng,
+      speed:           location.speed,
+      accuracy:        location.accuracy,
+      timestamp:       location.timestamp,
+      isActive:        location.isActive,
+      isRecent,
+      encryptedCoords: location.encryptedCoords || ''
+    });
   } catch (error) {
     console.error('Error fetching location:', error);
     res.status(500).json({ error: error.message });
@@ -506,6 +547,47 @@ app.get('/api/users/blocked/:trackId', async (req, res) => {
     });
   } catch (err) {
     console.error('Error fetching blocked users:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── 3. NEW: Privacy settings routes ──────────────────────────────────────────
+
+// GET /api/users/privacy/:trackId
+app.get('/api/users/privacy/:trackId', async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    const user = await User.findOne({ trackId }, 'privacyMode approvedIds').lean();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({
+      privacyMode: user.privacyMode || 'EVERYONE',
+      approvedIds: user.approvedIds || []
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/users/privacy
+app.post('/api/users/privacy', async (req, res) => {
+  try {
+    const { myTrackId, privacyMode, approvedIds } = req.body;
+    if (!myTrackId) return res.status(400).json({ error: 'myTrackId required' });
+
+    const validModes = ['EVERYONE', 'CONTACTS_ONLY', 'SELECTED'];
+    const mode = validModes.includes(privacyMode) ? privacyMode : 'EVERYONE';
+
+    await User.findOneAndUpdate(
+      { trackId: myTrackId },
+      {
+        privacyMode: mode,
+        approvedIds: Array.isArray(approvedIds) ? approvedIds : [],
+        updatedAt: new Date()
+      }
+    );
+    console.log(`🔒 Privacy updated for ${myTrackId}: ${mode}`);
+    res.json({ success: true });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
