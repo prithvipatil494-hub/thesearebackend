@@ -10,6 +10,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 const server = http.createServer(app);
@@ -32,11 +33,43 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// ─── Image Storage Setup ─────────────────────────────────────────────────────
-const UPLOADS_DIR = path.join(__dirname, 'uploads', 'chat');
+// ─── Cloudinary Configuration ───────────────────────────────────────────────────
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key:    process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-if (!fs.existsSync(UPLOADS_DIR)) {
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// Helper — upload base64 to Cloudinary, returns secure URL
+async function uploadToCloudinary(base64String, folder = 'chat') {
+    const result = await cloudinary.uploader.upload(
+        `data:image/jpeg;base64,${base64String}`,
+        {
+            folder,
+            resource_type: 'image',
+            transformation: [
+                { width: 1280, crop: 'limit' },   // cap at 1280px
+                { quality: 'auto:good' },          // auto compress
+                { fetch_format: 'auto' }           // serve webp/avif if supported
+            ]
+        }
+    );
+    return {
+        url:       result.secure_url,
+        publicId:  result.public_id,
+        width:     result.width,
+        height:    result.height
+    };
+}
+
+// Helper — delete from Cloudinary by public_id
+async function deleteFromCloudinary(publicId) {
+    if (!publicId) return;
+    try {
+        await cloudinary.uploader.destroy(publicId);
+    } catch (err) {
+        console.error('Cloudinary delete error:', err.message);
+    }
 }
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
@@ -100,7 +133,7 @@ pathHistorySchema.pre('save', function(next) {
   next();
 });
 
-// ─── Message schema — now uses imageId for file-based storage ───────────────────
+// ─── Message schema — now uses Cloudinary URLs ─────────────────────────────────
 const messageSchema = new mongoose.Schema({
   conversationId: { type: String, index: true },
   senderId:       String,
@@ -110,20 +143,26 @@ const messageSchema = new mongoose.Schema({
   readBy:         { type: [String], default: [] },
   // Photo / video sharing fields
   type:           { type: String, default: 'text', enum: ['text', 'image', 'video'] },
-  imageId:        { type: String, default: '' },  // filename only, no base64
-  videoDelivered: { type: Boolean, default: false }  // set true once video fetched by receiver
+  imageUrl:       { type: String, default: '' },   // Cloudinary URL
+  imagePublicId:  { type: String, default: '' },   // Cloudinary public_id for deletion
+  imageBase64:    { type: String, default: '' },   // Keep for migration, will be deprecated
+  videoDelivered: { type: Boolean, default: false }
 });
 messageSchema.index({ conversationId: 1, timestamp: 1 });
 messageSchema.index({ conversationId: 1, readBy: 1 });
 
-// ─── Image batch schema — stores multiple images as one encrypted batch ─────────
+// ─── Image batch schema — stores Cloudinary URLs for batch uploads ───────────────
 const imageBatchSchema = new mongoose.Schema({
   batchId:        { type: String, unique: true, index: true },
   conversationId: { type: String, index: true },
   senderId:       String,
   senderName:     String,
-  images:         [{ encryptedBase64: String, timestamp: Number }],
-  timestamp:      { type: Number, default: () => Date.now() }
+  images: [{
+    imageUrl:      String,   // Cloudinary URL
+    imagePublicId: String,   // Cloudinary public_id for deletion
+    timestamp:     Number
+  }],
+  timestamp: { type: Number, default: () => Date.now() }
 });
 const ImageBatch = mongoose.model('ImageBatch', imageBatchSchema);
 
@@ -1238,13 +1277,12 @@ app.post('/api/chat/send', async (req, res) => {
     const ts = Date.now();
     const displayText = msgType === 'image' ? '__image__' : (text || '');
     
-    let imageId = '';
+    let imageUrl = '', imagePublicId = '';
     if (msgType === 'image') {
-      // Decode and write to disk
-      const buffer = Buffer.from(imageBase64, 'base64');
-      imageId = `${uuidv4()}.jpg`;
-      const filePath = path.join(UPLOADS_DIR, imageId);
-      fs.writeFileSync(filePath, buffer);
+      // Upload to Cloudinary
+      const uploaded = await uploadToCloudinary(imageBase64, `chat/${conversationId}`);
+      imageUrl = uploaded.url;
+      imagePublicId = uploaded.publicId;
     }
 
     const savedMessage = await Message.create({
@@ -1255,7 +1293,8 @@ app.post('/api/chat/send', async (req, res) => {
       timestamp:   ts,
       readBy:      [senderId],
       type:        msgType,
-      imageId:     imageId
+      imageUrl,
+      imagePublicId
     });
 
     await Conversation.findOneAndUpdate(
@@ -1283,10 +1322,8 @@ app.post('/api/chat/send', async (req, res) => {
       timestamp:      ts,
       readBy:         [senderId],
       type:           msgType,
-      imageId:        imageId,
-      imageUrl:       msgType === 'image' 
-                        ? `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/chat/image/${imageId}` 
-                        : ''
+      imageUrl:       imageUrl,
+      imageBase64:    ''
     };
 
     io.to(`conversation:${conversationId}`).emit('chat:message', payload);
@@ -1317,30 +1354,35 @@ app.post('/api/chat/send-batch', async (req, res) => {
     }
 
     const [senderUser, receiverUser] = await Promise.all([
-      User.findOne({ trackId: senderId }, 'blockedUsers blockedBy').lean(),
-      User.findOne({ trackId: receiverId }, 'blockedUsers blockedBy').lean()
+      User.findOne({ trackId: senderId }, 'blockedUsers').lean(),
+      User.findOne({ trackId: receiverId }, 'blockedUsers').lean()
     ]);
-    const senderBlocked   = senderUser?.blockedUsers?.includes(receiverId) || false;
-    const receiverBlocked = receiverUser?.blockedUsers?.includes(senderId)  || false;
-
-    if (senderBlocked || receiverBlocked) {
+    if (senderUser?.blockedUsers?.includes(receiverId) || receiverUser?.blockedUsers?.includes(senderId)) {
       return res.status(403).json({ error: 'Message blocked', blocked: true });
     }
+
+    // Upload all images to Cloudinary in parallel
+    const uploadedImages = await Promise.all(
+      images.map(async (img, idx) => {
+        const decoded = img.encryptedBase64; // Client already encrypts
+        const uploaded = await uploadToCloudinary(decoded, `chat/${conversationId}`);
+        return {
+          imageUrl: uploaded.url,
+          imagePublicId: uploaded.publicId,
+          timestamp: Date.now() + idx
+        };
+      })
+    );
 
     const batchId = `batch-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const ts = Date.now();
 
-    const batchImages = images.map((img, idx) => ({
-      encryptedBase64: img.encryptedBase64,
-      timestamp: ts + idx
-    }));
-
-    const savedBatch = await ImageBatch.create({
+    await ImageBatch.create({
       batchId,
       conversationId,
       senderId,
       senderName,
-      images: batchImages,
+      images: uploadedImages,
       timestamp: ts
     });
 
@@ -1348,11 +1390,12 @@ app.post('/api/chat/send-batch', async (req, res) => {
       conversationId,
       senderId,
       senderName,
-      text:        `__batch:${batchId}__`,
-      timestamp:   ts,
-      readBy:      [senderId],
-      type:        'image',
-      imageBase64: batchId
+      text: `__batch:${batchId}__`,
+      timestamp: ts,
+      readBy: [senderId],
+      type: 'image',
+      imageUrl: '',
+      imagePublicId: ''
     });
 
     await Conversation.findOneAndUpdate(
@@ -1360,34 +1403,35 @@ app.post('/api/chat/send-batch', async (req, res) => {
       {
         $set: {
           conversationId,
-          lastMessage:             `${images.length} photos`,
-          lastTimestamp:           ts,
-          [`names.${senderId}`]:   senderName,
+          lastMessage: `${images.length} photos`,
+          lastTimestamp: ts,
+          [`names.${senderId}`]: senderName,
           [`names.${receiverId}`]: receiverName,
         },
         $addToSet: { participants: { $each: [senderId, receiverId] } },
-        $inc:      { [`unread.${receiverId}`]: 1 },
+        $inc: { [`unread.${receiverId}`]: 1 },
       },
       { upsert: true, new: true }
     );
 
     const payload = {
-      _id:            savedMessage._id.toString(),
+      _id: savedMessage._id.toString(),
       conversationId,
       senderId,
       senderName,
-      text:           `__batch:${batchId}__`,
-      timestamp:      ts,
-      readBy:         [senderId],
-      type:           'image',
-      imageBase64:    batchId
+      text: `__batch:${batchId}__`,
+      timestamp: ts,
+      readBy: [senderId],
+      type: 'image',
+      imageUrl: '',
+      imageBase64: ''
     };
 
     io.to(`conversation:${conversationId}`).emit('chat:message', payload);
     io.to(`user:${receiverId}`).emit('chat:newMessage', payload);
     io.to(`user:${senderId}`).emit('chat:message', payload);
 
-    console.log(`📦 Batch sent in ${conversationId} with ${images.length} images`);
+    console.log(`📦 Batch uploaded to Cloudinary: ${batchId}`);
     res.json({ ok: true, messageId: savedMessage._id.toString(), batchId });
 
   } catch (error) {
@@ -1397,51 +1441,27 @@ app.post('/api/chat/send-batch', async (req, res) => {
 });
 
 // GET /api/chat/batch/:batchId
-// Retrieves a batch of images and deletes it after first fetch
+// Retrieves a batch of images from Cloudinary
 app.get('/api/chat/batch/:batchId', async (req, res) => {
   try {
     const { batchId } = req.params;
-
     const batch = await ImageBatch.findOne({ batchId }).lean();
-    if (!batch) {
-      return res.status(404).json({ error: 'Batch not found' });
-    }
+    if (!batch) return res.status(404).json({ error: 'Batch not found' });
 
-    const response = {
+    res.json({
       batchId:        batch.batchId,
       conversationId: batch.conversationId,
       senderId:       batch.senderId,
-      senderName:     batch.senderName,
-      images:         batch.images,
-      timestamp:      batch.timestamp
-    };
-
-    // Delete batch immediately after sending to receiver
-    await ImageBatch.deleteOne({ batchId });
-    res.json(response);
-
+      images:         batch.images.map(img => ({
+        imageUrl:  img.imageUrl,
+        timestamp: img.timestamp
+      }))
+    });
+    // Don't delete — Cloudinary handles storage
   } catch (error) {
     console.error('Error fetching batch:', error);
     res.status(500).json({ error: error.message });
   }
-});
-
-// ─── Image serving endpoint ─────────────────────────────────────────────────────
-app.get('/api/chat/image/:imageId', (req, res) => {
-  const { imageId } = req.params;
-  
-  // Sanitize — prevent path traversal attacks
-  const safeName = path.basename(imageId);
-  const filePath = path.join(UPLOADS_DIR, safeName);
-  
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'Image not found' });
-  }
-  
-  // Cache headers — images never change once stored
-  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-  res.setHeader('Content-Type', 'image/jpeg');
-  res.sendFile(filePath);
 });
 
 app.get('/api/chat/conversations/:trackId', async (req, res) => {
@@ -1472,7 +1492,6 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       if (!isNaN(sinceTs)) query.timestamp = { $gt: sinceTs };
     }
     const msgs = await Message.find(query).sort({ timestamp: 1 }).limit(200);
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
     res.json(msgs.map(m => ({
       _id:            m._id.toString(),
       conversationId: m.conversationId,
@@ -1482,8 +1501,8 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       timestamp:      m.timestamp,
       readBy:         m.readBy || [],
       type:           m.type || 'text',
-      imageId:        m.imageId || '',
-      imageUrl:       m.imageId ? `${backendUrl}/api/chat/image/${m.imageId}` : ''
+      imageUrl:       m.imageUrl || '',
+      imageBase64:    ''
     })));
   } catch (error) {
     console.error('Error fetching messages:', error);
@@ -1512,12 +1531,21 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(messageId)) return res.status(400).json({ error: 'Invalid message ID' });
     const message = await Message.findById(messageId);
     if (!message) return res.json({ ok: true, alreadyDeleted: true });
-    const { conversationId, text } = message;
+    const { conversationId, text, imagePublicId } = message;
     
-    // Delete batch if this is a batch message
-    if (text && text.startsWith('__batch:')) {
+    // Delete from Cloudinary if single image
+    if (imagePublicId) await deleteFromCloudinary(imagePublicId);
+
+    // Delete batch images from Cloudinary if batch message
+    if (text?.startsWith('__batch:')) {
       const batchId = text.replace('__batch:', '').replace('__', '');
-      await ImageBatch.deleteOne({ batchId });
+      const batch = await ImageBatch.findOne({ batchId }).lean();
+      if (batch) {
+        await Promise.all(
+          batch.images.map(img => deleteFromCloudinary(img.imagePublicId))
+        );
+        await ImageBatch.deleteOne({ batchId });
+      }
     }
     
     await Message.deleteOne({ _id: messageId });
@@ -1536,7 +1564,19 @@ app.delete('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
     
-    // Delete all batches in this conversation
+    // Delete all Cloudinary images in this conversation
+    const messages = await Message.find({ conversationId }).lean();
+    await Promise.all(
+      messages
+        .filter(m => m.imagePublicId)
+        .map(m => deleteFromCloudinary(m.imagePublicId))
+    );
+
+    // Delete all batch images from Cloudinary
+    const batches = await ImageBatch.find({ conversationId }).lean();
+    await Promise.all(
+      batches.flatMap(b => b.images.map(img => deleteFromCloudinary(img.imagePublicId)))
+    );
     await ImageBatch.deleteMany({ conversationId });
     
     await Message.deleteMany({ conversationId });
@@ -1679,34 +1719,9 @@ app.use((err, req, res, next) => { console.error('Global error:', err); res.stat
 
 // ==================== START ====================
 
-// ─── Cleanup job for orphaned images ───────────────────────────────────────────
-setInterval(async () => {
-  try {
-    const cutoff = Date.now() - 30 * 24 * 3600 * 1000; // 30 days ago
-    const files = fs.readdirSync(UPLOADS_DIR);
-    
-    for (const file of files) {
-      const filePath = path.join(UPLOADS_DIR, file);
-      const stat = fs.statSync(filePath);
-      
-      if (stat.mtimeMs < cutoff) {
-        // Double-check it's not referenced in DB before deleting
-        const imageId = file;
-        const ref = await Message.exists({ imageId });
-        if (!ref) {
-          fs.unlinkSync(filePath);
-          console.log(`🗑 Cleaned up orphaned image: ${file}`);
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Image cleanup error:', err);
-  }
-}, 6 * 60 * 60 * 1000); // every 6 hours
-
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Socket.IO ready`);
-  console.log(`✅ All endpoints configured`);
+console.log(`🚀 Server running on port ${PORT}`);
+console.log(`📡 Socket.IO ready`);
+console.log(`✅ All endpoints configured`);
 });
