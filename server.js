@@ -7,6 +7,9 @@ const http = require('http');
 const socketIo = require('socket.io');
 const NodeCache = require('node-cache');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const server = http.createServer(app);
@@ -29,13 +32,21 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// ─── Image Storage Setup ─────────────────────────────────────────────────────
+const UPLOADS_DIR = path.join(__dirname, 'uploads', 'chat');
+
+if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
 // ─── Caches ───────────────────────────────────────────────────────────────────
-const locationCache  = new NodeCache({ stdTTL: 2,    checkperiod: 1  });
+const locationCache  = new NodeCache({ stdTTL: 4,    checkperiod: 1  });
 const mapMatchCache  = new NodeCache({ stdTTL: 30,   checkperiod: 10 });
 const roadSnapCache  = new NodeCache({ stdTTL: 300,  checkperiod: 60 });
 const batchQueue     = new Map();
 const batchTimers    = new Map();
 const BATCH_FLUSH_MS = 800;
+
 const MAPBOX_DIRECTIONS_TOKEN = process.env.MAPBOX_TOKEN;
 
 // Raise body size limit to 50 MB to accommodate base64 video payloads
@@ -89,7 +100,7 @@ pathHistorySchema.pre('save', function(next) {
   next();
 });
 
-// ─── Message schema — now includes type + imageBase64 ─────────────────────────
+// ─── Message schema — now uses imageId for file-based storage ───────────────────
 const messageSchema = new mongoose.Schema({
   conversationId: { type: String, index: true },
   senderId:       String,
@@ -99,7 +110,7 @@ const messageSchema = new mongoose.Schema({
   readBy:         { type: [String], default: [] },
   // Photo / video sharing fields
   type:           { type: String, default: 'text', enum: ['text', 'image', 'video'] },
-  imageBase64:    { type: String, default: '' },  // base64 JPEG (image) or MP4 (video)
+  imageId:        { type: String, default: '' },  // filename only, no base64
   videoDelivered: { type: Boolean, default: false }  // set true once video fetched by receiver
 });
 messageSchema.index({ conversationId: 1, timestamp: 1 });
@@ -115,9 +126,6 @@ const imageBatchSchema = new mongoose.Schema({
   timestamp:      { type: Number, default: () => Date.now() }
 });
 const ImageBatch = mongoose.model('ImageBatch', imageBatchSchema);
-
-// ─── Batch cache for fast retrieval ───────────────────────────────────────────
-const batchCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 
 const conversationSchema = new mongoose.Schema({
   conversationId: { type: String, unique: true },
@@ -1229,6 +1237,15 @@ app.post('/api/chat/send', async (req, res) => {
 
     const ts = Date.now();
     const displayText = msgType === 'image' ? '__image__' : (text || '');
+    
+    let imageId = '';
+    if (msgType === 'image') {
+      // Decode and write to disk
+      const buffer = Buffer.from(imageBase64, 'base64');
+      imageId = `${uuidv4()}.jpg`;
+      const filePath = path.join(UPLOADS_DIR, imageId);
+      fs.writeFileSync(filePath, buffer);
+    }
 
     const savedMessage = await Message.create({
       conversationId,
@@ -1238,7 +1255,7 @@ app.post('/api/chat/send', async (req, res) => {
       timestamp:   ts,
       readBy:      [senderId],
       type:        msgType,
-      imageBase64: msgType === 'image' ? imageBase64 : ''
+      imageId:     imageId
     });
 
     await Conversation.findOneAndUpdate(
@@ -1266,7 +1283,10 @@ app.post('/api/chat/send', async (req, res) => {
       timestamp:      ts,
       readBy:         [senderId],
       type:           msgType,
-      imageBase64:    msgType === 'image' ? imageBase64 : ''
+      imageId:        imageId,
+      imageUrl:       msgType === 'image' 
+                        ? `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/chat/image/${imageId}` 
+                        : ''
     };
 
     io.to(`conversation:${conversationId}`).emit('chat:message', payload);
@@ -1377,15 +1397,10 @@ app.post('/api/chat/send-batch', async (req, res) => {
 });
 
 // GET /api/chat/batch/:batchId
-// Retrieves a batch of images (cached for 5 minutes)
+// Retrieves a batch of images and deletes it after first fetch
 app.get('/api/chat/batch/:batchId', async (req, res) => {
   try {
     const { batchId } = req.params;
-
-    const cached = batchCache.get(batchId);
-    if (cached) {
-      return res.json(cached);
-    }
 
     const batch = await ImageBatch.findOne({ batchId }).lean();
     if (!batch) {
@@ -1401,13 +1416,32 @@ app.get('/api/chat/batch/:batchId', async (req, res) => {
       timestamp:      batch.timestamp
     };
 
-    batchCache.set(batchId, response);
+    // Delete batch immediately after sending to receiver
+    await ImageBatch.deleteOne({ batchId });
     res.json(response);
 
   } catch (error) {
     console.error('Error fetching batch:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ─── Image serving endpoint ─────────────────────────────────────────────────────
+app.get('/api/chat/image/:imageId', (req, res) => {
+  const { imageId } = req.params;
+  
+  // Sanitize — prevent path traversal attacks
+  const safeName = path.basename(imageId);
+  const filePath = path.join(UPLOADS_DIR, safeName);
+  
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Image not found' });
+  }
+  
+  // Cache headers — images never change once stored
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.sendFile(filePath);
 });
 
 app.get('/api/chat/conversations/:trackId', async (req, res) => {
@@ -1438,6 +1472,7 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       if (!isNaN(sinceTs)) query.timestamp = { $gt: sinceTs };
     }
     const msgs = await Message.find(query).sort({ timestamp: 1 }).limit(200);
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3000';
     res.json(msgs.map(m => ({
       _id:            m._id.toString(),
       conversationId: m.conversationId,
@@ -1447,7 +1482,8 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       timestamp:      m.timestamp,
       readBy:         m.readBy || [],
       type:           m.type || 'text',
-      imageBase64:    m.imageBase64 || ''
+      imageId:        m.imageId || '',
+      imageUrl:       m.imageId ? `${backendUrl}/api/chat/image/${m.imageId}` : ''
     })));
   } catch (error) {
     console.error('Error fetching messages:', error);
@@ -1482,7 +1518,6 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
     if (text && text.startsWith('__batch:')) {
       const batchId = text.replace('__batch:', '').replace('__', '');
       await ImageBatch.deleteOne({ batchId });
-      batchCache.del(batchId);
     }
     
     await Message.deleteOne({ _id: messageId });
@@ -1502,10 +1537,6 @@ app.delete('/api/chat/messages/:conversationId', async (req, res) => {
     const { conversationId } = req.params;
     
     // Delete all batches in this conversation
-    const batches = await ImageBatch.find({ conversationId }).select('batchId');
-    batches.forEach(batch => {
-      batchCache.del(batch.batchId);
-    });
     await ImageBatch.deleteMany({ conversationId });
     
     await Message.deleteMany({ conversationId });
@@ -1647,6 +1678,31 @@ app.use((req, res) => { res.status(404).json({ error: 'Endpoint not found', path
 app.use((err, req, res, next) => { console.error('Global error:', err); res.status(500).json({ error: 'Internal server error', message: err.message }); });
 
 // ==================== START ====================
+
+// ─── Cleanup job for orphaned images ───────────────────────────────────────────
+setInterval(async () => {
+  try {
+    const cutoff = Date.now() - 30 * 24 * 3600 * 1000; // 30 days ago
+    const files = fs.readdirSync(UPLOADS_DIR);
+    
+    for (const file of files) {
+      const filePath = path.join(UPLOADS_DIR, file);
+      const stat = fs.statSync(filePath);
+      
+      if (stat.mtimeMs < cutoff) {
+        // Double-check it's not referenced in DB before deleting
+        const imageId = file;
+        const ref = await Message.exists({ imageId });
+        if (!ref) {
+          fs.unlinkSync(filePath);
+          console.log(`🗑 Cleaned up orphaned image: ${file}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Image cleanup error:', err);
+  }
+}, 6 * 60 * 60 * 1000); // every 6 hours
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
