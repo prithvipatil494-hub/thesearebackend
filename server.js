@@ -105,6 +105,20 @@ const messageSchema = new mongoose.Schema({
 messageSchema.index({ conversationId: 1, timestamp: 1 });
 messageSchema.index({ conversationId: 1, readBy: 1 });
 
+// ─── Image batch schema — stores multiple images as one encrypted batch ─────────
+const imageBatchSchema = new mongoose.Schema({
+  batchId:        { type: String, unique: true, index: true },
+  conversationId: { type: String, index: true },
+  senderId:       String,
+  senderName:     String,
+  images:         [{ encryptedBase64: String, timestamp: Number }],
+  timestamp:      { type: Number, default: () => Date.now() }
+});
+const ImageBatch = mongoose.model('ImageBatch', imageBatchSchema);
+
+// ─── Batch cache for fast retrieval ───────────────────────────────────────────
+const batchCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+
 const conversationSchema = new mongoose.Schema({
   conversationId: { type: String, unique: true },
   participants:   [String],
@@ -1268,6 +1282,134 @@ app.post('/api/chat/send', async (req, res) => {
   }
 });
 
+// POST /api/chat/send-batch
+// Sends multiple images as one encrypted batch for better performance
+app.post('/api/chat/send-batch', async (req, res) => {
+  try {
+    const { conversationId, senderId, senderName, receiverId, receiverName, images } = req.body;
+
+    if (!conversationId || !senderId || !receiverId || !Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({ error: 'Missing required fields or images array' });
+    }
+
+    if (images.length > 10) {
+      return res.status(400).json({ error: 'Max 10 images per batch' });
+    }
+
+    const [senderUser, receiverUser] = await Promise.all([
+      User.findOne({ trackId: senderId }, 'blockedUsers blockedBy').lean(),
+      User.findOne({ trackId: receiverId }, 'blockedUsers blockedBy').lean()
+    ]);
+    const senderBlocked   = senderUser?.blockedUsers?.includes(receiverId) || false;
+    const receiverBlocked = receiverUser?.blockedUsers?.includes(senderId)  || false;
+
+    if (senderBlocked || receiverBlocked) {
+      return res.status(403).json({ error: 'Message blocked', blocked: true });
+    }
+
+    const batchId = `batch-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const ts = Date.now();
+
+    const batchImages = images.map((img, idx) => ({
+      encryptedBase64: img.encryptedBase64,
+      timestamp: ts + idx
+    }));
+
+    const savedBatch = await ImageBatch.create({
+      batchId,
+      conversationId,
+      senderId,
+      senderName,
+      images: batchImages,
+      timestamp: ts
+    });
+
+    const savedMessage = await Message.create({
+      conversationId,
+      senderId,
+      senderName,
+      text:        `__batch:${batchId}__`,
+      timestamp:   ts,
+      readBy:      [senderId],
+      type:        'image',
+      imageBase64: batchId
+    });
+
+    await Conversation.findOneAndUpdate(
+      { conversationId },
+      {
+        $set: {
+          conversationId,
+          lastMessage:             `${images.length} photos`,
+          lastTimestamp:           ts,
+          [`names.${senderId}`]:   senderName,
+          [`names.${receiverId}`]: receiverName,
+        },
+        $addToSet: { participants: { $each: [senderId, receiverId] } },
+        $inc:      { [`unread.${receiverId}`]: 1 },
+      },
+      { upsert: true, new: true }
+    );
+
+    const payload = {
+      _id:            savedMessage._id.toString(),
+      conversationId,
+      senderId,
+      senderName,
+      text:           `__batch:${batchId}__`,
+      timestamp:      ts,
+      readBy:         [senderId],
+      type:           'image',
+      imageBase64:    batchId
+    };
+
+    io.to(`conversation:${conversationId}`).emit('chat:message', payload);
+    io.to(`user:${receiverId}`).emit('chat:newMessage', payload);
+    io.to(`user:${senderId}`).emit('chat:message', payload);
+
+    console.log(`📦 Batch sent in ${conversationId} with ${images.length} images`);
+    res.json({ ok: true, messageId: savedMessage._id.toString(), batchId });
+
+  } catch (error) {
+    console.error('Error sending batch:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/chat/batch/:batchId
+// Retrieves a batch of images (cached for 5 minutes)
+app.get('/api/chat/batch/:batchId', async (req, res) => {
+  try {
+    const { batchId } = req.params;
+
+    const cached = batchCache.get(batchId);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const batch = await ImageBatch.findOne({ batchId }).lean();
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+
+    const response = {
+      batchId:        batch.batchId,
+      conversationId: batch.conversationId,
+      senderId:       batch.senderId,
+      senderName:     batch.senderName,
+      images:         batch.images,
+      timestamp:      batch.timestamp
+    };
+
+    batchCache.set(batchId, response);
+    res.json(response);
+
+  } catch (error) {
+    console.error('Error fetching batch:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/chat/conversations/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
@@ -1334,7 +1476,15 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(messageId)) return res.status(400).json({ error: 'Invalid message ID' });
     const message = await Message.findById(messageId);
     if (!message) return res.json({ ok: true, alreadyDeleted: true });
-    const { conversationId } = message;
+    const { conversationId, text } = message;
+    
+    // Delete batch if this is a batch message
+    if (text && text.startsWith('__batch:')) {
+      const batchId = text.replace('__batch:', '').replace('__', '');
+      await ImageBatch.deleteOne({ batchId });
+      batchCache.del(batchId);
+    }
+    
     await Message.deleteOne({ _id: messageId });
     const latestMsg = await Message.findOne({ conversationId }).sort({ timestamp: -1 });
     await Conversation.findOneAndUpdate({ conversationId }, { lastMessage: latestMsg ? latestMsg.text : '', lastTimestamp: latestMsg ? latestMsg.timestamp : 0 });
@@ -1350,6 +1500,14 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
 app.delete('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
+    
+    // Delete all batches in this conversation
+    const batches = await ImageBatch.find({ conversationId }).select('batchId');
+    batches.forEach(batch => {
+      batchCache.del(batch.batchId);
+    });
+    await ImageBatch.deleteMany({ conversationId });
+    
     await Message.deleteMany({ conversationId });
     await Conversation.findOneAndUpdate({ conversationId }, { lastMessage: '', lastTimestamp: 0 });
     io.to(`conversation:${conversationId}`).emit('chat:cleared', { conversationId });
