@@ -1279,7 +1279,7 @@ app.post('/api/chat/send', async (req, res) => {
     
     let imageUrl = '', imagePublicId = '';
     if (msgType === 'image') {
-      // Upload to Cloudinary
+      // Upload to Cloudinary (client sends unencrypted base64 for images)
       const uploaded = await uploadToCloudinary(imageBase64, `chat/${conversationId}`);
       imageUrl = uploaded.url;
       imagePublicId = uploaded.publicId;
@@ -1364,7 +1364,7 @@ app.post('/api/chat/send-batch', async (req, res) => {
     // Upload all images to Cloudinary in parallel
     const uploadedImages = await Promise.all(
       images.map(async (img, idx) => {
-        const decoded = img.encryptedBase64; // Client already encrypts
+        const decoded = img.encryptedBase64; // Client sends unencrypted base64
         const uploaded = await uploadToCloudinary(decoded, `chat/${conversationId}`);
         return {
           imageUrl: uploaded.url,
@@ -1491,7 +1491,7 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       const sinceTs = parseInt(since, 10);
       if (!isNaN(sinceTs)) query.timestamp = { $gt: sinceTs };
     }
-    const msgs = await Message.find(query).sort({ timestamp: 1 }).limit(200);
+    const msgs = await Message.find(query).sort({ timestamp: 1 }).limit(500);
     res.json(msgs.map(m => ({
       _id:            m._id.toString(),
       conversationId: m.conversationId,
