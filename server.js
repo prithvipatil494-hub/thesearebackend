@@ -1246,7 +1246,10 @@ app.post('/api/chat/send', async (req, res) => {
   try {
     const { conversationId, senderId, senderName, receiverId, receiverName, text, type, imageBase64 } = req.body;
 
+    console.log(`📨 Received message: conversationId=${conversationId}, senderId=${senderId}, receiverId=${receiverId}, type=${type}`);
+
     if (!conversationId || !senderId || !receiverId) {
+      console.error('❌ Missing required fields');
       return res.status(400).json({ error: 'Missing required fields: conversationId, senderId, receiverId' });
     }
 
@@ -1258,7 +1261,10 @@ app.post('/api/chat/send', async (req, res) => {
     const senderBlocked   = senderUser?.blockedUsers?.includes(receiverId) || false;
     const receiverBlocked = receiverUser?.blockedUsers?.includes(senderId)  || false;
 
+    console.log(`🔍 Block check: senderBlocked=${senderBlocked}, receiverBlocked=${receiverBlocked}`);
+
     if (senderBlocked || receiverBlocked) {
+      console.log('🚫 Message blocked due to user blocking');
       return res.status(403).json({ error: 'Message blocked', blocked: true });
     }
 
@@ -1296,6 +1302,8 @@ app.post('/api/chat/send', async (req, res) => {
       imageUrl,
       imagePublicId
     });
+
+    console.log(`💾 Message saved to DB: _id=${savedMessage._id}, conversationId=${conversationId}`);
 
     await Conversation.findOneAndUpdate(
       { conversationId },
@@ -1485,6 +1493,7 @@ app.get('/api/chat/conversations/:trackId', async (req, res) => {
 app.get('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
+    console.log(`📥 Fetching messages for conversation: ${conversationId}`);
     const { since } = req.query;  // optional: only return messages newer than this timestamp
     const query = { conversationId };
     if (since) {
@@ -1492,6 +1501,7 @@ app.get('/api/chat/messages/:conversationId', async (req, res) => {
       if (!isNaN(sinceTs)) query.timestamp = { $gt: sinceTs };
     }
     const msgs = await Message.find(query).sort({ timestamp: 1 }).limit(500);
+    console.log(`📊 Found ${msgs.length} messages in database for ${conversationId}`);
     res.json(msgs.map(m => ({
       _id:            m._id.toString(),
       conversationId: m.conversationId,
@@ -1563,9 +1573,11 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
 app.delete('/api/chat/messages/:conversationId', async (req, res) => {
   try {
     const { conversationId } = req.params;
-    
+    console.log(`🗑️ DELETE request received for conversation: ${conversationId}`);
+
     // Delete all Cloudinary images in this conversation
     const messages = await Message.find({ conversationId }).lean();
+    console.log(`📊 Found ${messages.length} messages to delete in ${conversationId}`);
     await Promise.all(
       messages
         .filter(m => m.imagePublicId)
@@ -1711,6 +1723,17 @@ setInterval(async () => {
     console.error('Cleanup error:', error);
   }
 }, 60 * 60 * 1000);
+
+// ==================== KEEP-ALIVE (Render cold start prevention) ====================
+
+// Ping self every 14 minutes to prevent Render free tier from spinning down
+// Render sleeps after 15 min of inactivity; this keeps it warm
+setInterval(() => {
+  const http = require('http');
+  http.get(`http://localhost:${PORT}/api/health`, (res) => {
+    console.log(' Keep-alive ping:', res.statusCode);
+  }).on('error', () => {});
+}, 14 * 60 * 1000);
 
 // ==================== ERROR HANDLING ====================
 
