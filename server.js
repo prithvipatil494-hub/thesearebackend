@@ -11,6 +11,8 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const server = http.createServer(app);
@@ -81,6 +83,7 @@ const batchTimers    = new Map();
 const BATCH_FLUSH_MS = 800;
 
 const MAPBOX_DIRECTIONS_TOKEN = process.env.MAPBOX_TOKEN;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 // Raise body size limit to 50 MB to accommodate base64 video payloads
 app.use(express.json({ limit: '50mb' }));
@@ -179,7 +182,8 @@ const userSchema = new mongoose.Schema({
   uid: { type: String, required: true, unique: true, index: true },
   trackId: { type: String, required: true, index: true },
   displayName: { type: String, default: '' },
-  email: { type: String, default: '' },
+  email: { type: String, required: true, unique: true, index: true },
+  passwordHash: { type: String, required: true },
   avatarBase64: { type: String, default: '' },
   friends: { type: [String], default: [] },
   savedFriends: {
@@ -241,6 +245,177 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date(), database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime() });
 });
 
+// ==================== AUTHENTICATION MIDDLEWARE ====================
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+// ==================== AUTH ROUTES ====================
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, displayName } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
+      return res.status(409).json({ error: 'User already exists' });
+    }
+
+    // Generate unique UID
+    const uid = uuidv4();
+
+    // Generate unique trackId
+    let trackId, exists = true;
+    while (exists) {
+      trackId = 'TRK-' + Math.random().toString(36).substr(2, 9).toUpperCase();
+      exists = await Location.findOne({ trackId });
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Create user
+    const user = await User.create({
+      uid,
+      trackId,
+      email: email.toLowerCase(),
+      passwordHash,
+      displayName: displayName || '',
+      avatarBase64: '',
+      friends: [],
+      savedFriends: [],
+      blockedUsers: [],
+      blockedBy: [],
+      privacyMode: 'EVERYONE',
+      approvedIds: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    // Create location entry
+    await Location.create({
+      trackId,
+      lat: 0,
+      lng: 0,
+      isActive: false
+    });
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { uid: user.uid, email: user.email, trackId: user.trackId },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    console.log(`📝 User registered: ${email} → ${trackId}`);
+    res.json({
+      success: true,
+      token,
+      user: {
+        uid: user.uid,
+        trackId: user.trackId,
+        email: user.email,
+        displayName: user.displayName,
+        avatarBase64: user.avatarBase64
+      }
+    });
+  } catch (error) {
+    console.error('Error registering user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Find user by email
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Verify password
+    const validPassword = await bcrypt.compare(password, user.passwordHash);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { uid: user.uid, email: user.email, trackId: user.trackId },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    console.log(`🔐 User logged in: ${email}`);
+    res.json({
+      success: true,
+      token,
+      user: {
+        uid: user.uid,
+        trackId: user.trackId,
+        email: user.email,
+        displayName: user.displayName,
+        avatarBase64: user.avatarBase64
+      }
+    });
+  } catch (error) {
+    console.error('Error logging in user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/auth/verify-token', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findOne({ uid: req.user.uid });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        uid: user.uid,
+        trackId: user.trackId,
+        email: user.email,
+        displayName: user.displayName,
+        avatarBase64: user.avatarBase64
+      }
+    });
+  } catch (error) {
+    console.error('Error verifying token:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== USER ROUTES ====================
 
 app.get('/api/user/by-trackid/:trackId', async (req, res) => {
@@ -255,9 +430,13 @@ app.get('/api/user/by-trackid/:trackId', async (req, res) => {
   }
 });
 
-app.get('/api/user/:uid', async (req, res) => {
+app.get('/api/user/:uid', authenticateToken, async (req, res) => {
   try {
     const { uid } = req.params;
+    // Only allow users to fetch their own data
+    if (uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     const user = await User.findOne({ uid });
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ uid: user.uid, trackId: user.trackId, displayName: user.displayName, email: user.email, avatarBase64: user.avatarBase64 || '', friends: user.friends, savedFriends: user.savedFriends || [] });
@@ -267,10 +446,14 @@ app.get('/api/user/:uid', async (req, res) => {
   }
 });
 
-app.post('/api/user/upsert', async (req, res) => {
+app.post('/api/user/upsert', authenticateToken, async (req, res) => {
   try {
     const { uid, trackId, displayName, email } = req.body;
     if (!uid || !trackId) return res.status(400).json({ error: 'uid and trackId are required' });
+    // Only allow users to upsert their own data
+    if (uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     const user = await User.findOneAndUpdate({ uid }, { uid, trackId, displayName: displayName || '', email: email || '', updatedAt: new Date() }, { upsert: true, new: true });
     await Location.findOneAndUpdate({ trackId }, { $setOnInsert: { trackId, lat: 0, lng: 0, isActive: false } }, { upsert: true });
     console.log(`👤 User upserted: ${uid} → ${trackId}`);
@@ -281,11 +464,15 @@ app.post('/api/user/upsert', async (req, res) => {
   }
 });
 
-app.post('/api/user/:uid/avatar', async (req, res) => {
+app.post('/api/user/:uid/avatar', authenticateToken, async (req, res) => {
   try {
     const { uid }          = req.params;
     const { avatarBase64 } = req.body;
     if (!avatarBase64) return res.status(400).json({ error: 'avatarBase64 required' });
+    // Only allow users to update their own avatar
+    if (uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     const user = await User.findOneAndUpdate({ uid }, { avatarBase64, updatedAt: new Date() }, { new: true });
     if (!user) return res.status(404).json({ error: 'User not found' });
     console.log(`🖼 Avatar updated for ${uid}`);
@@ -296,11 +483,15 @@ app.post('/api/user/:uid/avatar', async (req, res) => {
   }
 });
 
-app.post('/api/user/:uid/friends', async (req, res) => {
+app.post('/api/user/:uid/friends', authenticateToken, async (req, res) => {
   try {
     const { uid } = req.params;
     const { friends } = req.body;
     if (!Array.isArray(friends)) return res.status(400).json({ error: 'friends must be an array' });
+    // Only allow users to update their own friends
+    if (uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     const user = await User.findOneAndUpdate({ uid }, { friends, updatedAt: new Date() }, { new: true });
     if (!user) return res.status(404).json({ error: 'User not found' });
     console.log(`👥 Friends updated for ${uid}: [${friends.join(', ')}]`);
@@ -311,11 +502,15 @@ app.post('/api/user/:uid/friends', async (req, res) => {
   }
 });
 
-app.post('/api/user/:uid/saved-friends', async (req, res) => {
+app.post('/api/user/:uid/saved-friends', authenticateToken, async (req, res) => {
   try {
     const { uid } = req.params;
     const { savedFriends } = req.body;
     if (!Array.isArray(savedFriends)) return res.status(400).json({ error: 'savedFriends must be an array' });
+    // Only allow users to update their own saved friends
+    if (uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     const user = await User.findOneAndUpdate({ uid }, { savedFriends, updatedAt: new Date() }, { new: true });
     if (!user) return res.status(404).json({ error: 'User not found' });
     console.log(`💾 SavedFriends updated for ${uid}: ${savedFriends.length} entries`);
@@ -671,7 +866,7 @@ function serverKalman(trackId, lat, lng, accuracyM, nowMs, speedMs = 0) {
   return { lat: state.latEst, lng: state.lngEst };
 }
 
-app.post('/api/location/update', async (req, res) => {
+app.post('/api/location/update', authenticateToken, async (req, res) => {
   try {
     const {
       trackId, lat, lng, speed, accuracy,
@@ -681,6 +876,11 @@ app.post('/api/location/update', async (req, res) => {
     } = req.body;
 
     if (!trackId) return res.status(400).json({ error: 'Missing trackId' });
+
+    // Only allow users to update their own location
+    if (trackId !== req.user.trackId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
 
     const hasEncrypted = !!(encryptedCoords && encryptedCoords.length > 0);
 
@@ -1524,10 +1724,21 @@ app.post('/api/chat/read', async (req, res) => {
   try {
     const { conversationId, trackId } = req.body;
     if (!conversationId || !trackId) return res.status(400).json({ error: 'conversationId and trackId required' });
-    await Conversation.findOneAndUpdate({ conversationId }, { $set: { [`unread.${trackId}`]: 0 } });
-    await Message.updateMany({ conversationId, readBy: { $ne: trackId } }, { $addToSet: { readBy: trackId } });
+
+    // Emit Socket.IO event FIRST (instant double tick)
     io.to(`conversation:${conversationId}`).emit('chat:read', { conversationId, readBy: trackId });
     io.to(`user:${trackId}`).emit('chat:read', { conversationId, readBy: trackId });
+
+    // MongoDB writes happen in background (non-blocking)
+    setImmediate(async () => {
+      try {
+        await Conversation.findOneAndUpdate({ conversationId }, { $set: { [`unread.${trackId}`]: 0 } });
+        await Message.updateMany({ conversationId, readBy: { $ne: trackId } }, { $addToSet: { readBy: trackId } });
+      } catch (err) {
+        console.error('Background read update error:', err);
+      }
+    });
+
     res.json({ ok: true });
   } catch (error) {
     console.error('Error marking as read:', error);
@@ -1542,26 +1753,41 @@ app.delete('/api/chat/message/:messageId', async (req, res) => {
     const message = await Message.findById(messageId);
     if (!message) return res.json({ ok: true, alreadyDeleted: true });
     const { conversationId, text, imagePublicId } = message;
-    
-    // Delete from Cloudinary if single image
-    if (imagePublicId) await deleteFromCloudinary(imagePublicId);
 
-    // Delete batch images from Cloudinary if batch message
-    if (text?.startsWith('__batch:')) {
-      const batchId = text.replace('__batch:', '').replace('__', '');
-      const batch = await ImageBatch.findOne({ batchId }).lean();
-      if (batch) {
-        await Promise.all(
-          batch.images.map(img => deleteFromCloudinary(img.imagePublicId))
-        );
-        await ImageBatch.deleteOne({ batchId });
-      }
-    }
-    
+    // Delete from MongoDB FIRST (fast)
     await Message.deleteOne({ _id: messageId });
+
+    // Update conversation (fast)
     const latestMsg = await Message.findOne({ conversationId }).sort({ timestamp: -1 });
-    await Conversation.findOneAndUpdate({ conversationId }, { lastMessage: latestMsg ? latestMsg.text : '', lastTimestamp: latestMsg ? latestMsg.timestamp : 0 });
+    await Conversation.findOneAndUpdate(
+      { conversationId },
+      { lastMessage: latestMsg ? latestMsg.text : '', lastTimestamp: latestMsg ? latestMsg.timestamp : 0 }
+    );
+
+    // Emit Socket.IO event (instant)
     io.to(`conversation:${conversationId}`).emit('chat:messageDeleted', { messageId, conversationId });
+
+    // Cloudinary deletions happen in background (slow, non-blocking)
+    setImmediate(async () => {
+      try {
+        if (imagePublicId) await deleteFromCloudinary(imagePublicId);
+
+        if (text?.startsWith('__batch:')) {
+          const batchId = text.replace('__batch:', '').replace('__', '');
+          const batch = await ImageBatch.findOne({ batchId }).lean();
+          if (batch) {
+            await Promise.all(
+              batch.images.map(img => deleteFromCloudinary(img.imagePublicId))
+            );
+            await ImageBatch.deleteOne({ batchId });
+          }
+        }
+        console.log(`🗑 Cloudinary cleanup complete for: ${messageId}`);
+      } catch (err) {
+        console.error('Cloudinary cleanup error:', err);
+      }
+    });
+
     console.log(`🗑 Message deleted for everyone: ${messageId}`);
     res.json({ ok: true });
   } catch (error) {
