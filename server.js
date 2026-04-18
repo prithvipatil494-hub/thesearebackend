@@ -88,6 +88,8 @@ const BATCH_FLUSH_MS = 800;
 
 const MAPBOX_DIRECTIONS_TOKEN = process.env.MAPBOX_TOKEN;
 
+// 
+
 
 // Raise body size limit to 50 MB to accommodate base64 video payloads
 app.use(express.json({ limit: '50mb' }));
@@ -293,8 +295,9 @@ app.post('/api/auth/google', async (req, res) => {
       return res.status(400).json({ error: 'Invalid Google token: no email' });
     }
 
-    // Check if user exists in our database
-    let user = await User.findOne({ uid: googleUid });
+    // Check if user exists in our database (by uid or email as fallback)
+    let user = await User.findOne({ uid: googleUid })
+            || await User.findOne({ email: googleEmail.toLowerCase() });
 
     if (!user) {
       // Generate unique trackId
@@ -330,6 +333,13 @@ app.post('/api/auth/google', async (req, res) => {
       });
 
       console.log(`📝 User auto-registered on Google login: ${googleEmail} → ${trackId}`);
+    } else if (user.uid !== googleUid) {
+      // Migrate old record to new Google uid
+      user = await User.findOneAndUpdate(
+        { email: googleEmail.toLowerCase() },
+        { uid: googleUid, updatedAt: new Date() },
+        { new: true }
+      );
     }
 
     // Generate JWT token
