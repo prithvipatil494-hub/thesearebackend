@@ -83,8 +83,18 @@ const locationCache  = new NodeCache({ stdTTL: 4,    checkperiod: 1  });
 const mapMatchCache  = new NodeCache({ stdTTL: 30,   checkperiod: 10 });
 const roadSnapCache  = new NodeCache({ stdTTL: 300,  checkperiod: 60 });
 const batchQueue     = new Map();
+const watcherMap     = new Map(); // trackId → Set<watcherTrackId>
 const batchTimers    = new Map();
 const BATCH_FLUSH_MS = 800;
+
+// Call this when a user subscribes to watch someone
+function addWatcher(ownerTrackId, watcherTrackId) {
+  if (!watcherMap.has(ownerTrackId)) watcherMap.set(ownerTrackId, new Set());
+  watcherMap.get(ownerTrackId).add(watcherTrackId);
+}
+function removeWatcher(ownerTrackId, watcherTrackId) {
+  watcherMap.get(ownerTrackId)?.delete(watcherTrackId);
+}
 
 const MAPBOX_DIRECTIONS_TOKEN = process.env.MAPBOX_TOKEN;
 
@@ -768,6 +778,19 @@ async function flushBatch(trackId) {
     };
     io.to(`track:${trackId}`).emit('location:updated', updateData);
 
+    // Push to every user who is watching this trackId
+    const watchers = watcherMap.get(trackId);
+    if (watchers && watchers.size > 0) {
+      watchers.forEach(watcherTrackId => {
+        io.to(`user:${watcherTrackId}`).emit('friend:location', {
+          ...updateData,
+          lat: best.hasEncrypted ? undefined : snappedLat,
+          lng: best.hasEncrypted ? undefined : snappedLng,
+          encryptedCoords: best.encryptedCoords || ''
+        });
+      });
+    }
+
   } catch (err) {
     console.error(`Batch flush error for ${trackId}:`, err.message);
   }
@@ -806,7 +829,7 @@ function deadReckon(location, nowMs) {
   };
 }
 
-const IS_RECENT_MS = 2_000;
+const IS_RECENT_MS = 3_000;
 
 // ─── Server-side Kalman state store (in-memory, resets on restart) ────────────
 const kalmanStore = new Map(); // trackId → { latEst, lngEst, latVar, lngVar, lastMs }
@@ -937,7 +960,7 @@ app.get('/api/location/:trackId', async (req, res) => {
       if (privacyErr) return res.status(403).json(privacyErr);
 
       const nowMs    = Date.now();
-      const isRecent = cachedLoc.timestamp > new Date(nowMs - 2_000);
+      const isRecent = cachedLoc.timestamp > new Date(nowMs - 3_000);
 
       let outLat = cachedLoc.lat, outLng = cachedLoc.lng, extrapolated = false;
       if (!cachedLoc.encryptedCoords && isRecent && (cachedLoc.speed || 0) > 0.3) {
@@ -964,7 +987,7 @@ app.get('/api/location/:trackId', async (req, res) => {
     if (privacyErr) return res.status(403).json(privacyErr);
 
     const nowMs    = Date.now();
-    const isRecent = location.timestamp > new Date(nowMs - 2_000);
+    const isRecent = location.timestamp > new Date(nowMs - 3_000);
 
     let outLat = location.lat, outLng = location.lng, extrapolated = false;
     if (!location.encryptedCoords && isRecent && location.speed > 0.3) {
@@ -1047,7 +1070,7 @@ app.get('/api/locations/bulk', async (req, res) => {
         }
       }
 
-      const isRecent = new Date(loc.timestamp) > new Date(nowMs - 2_000);
+      const isRecent = new Date(loc.timestamp) > new Date(nowMs - 3_000);
       let outLat = loc.lat, outLng = loc.lng, extrapolated = false;
 
       if (!loc.encryptedCoords && isRecent && (loc.speed || 0) > 0.3) {
@@ -1819,6 +1842,14 @@ io.on('connection', (socket) => {
   });
   socket.on('track:unsubscribe', (trackId) => { socket.leave(`track:${trackId}`); });
   socket.on('user:join', (trackId) => { socket.join(`user:${trackId}`); socket.emit('user:joined', { trackId, success: true }); console.log(`👤 ${trackId} joined personal room`); });
+  socket.on('watch:friend', ({ myTrackId, friendTrackId }) => {
+    addWatcher(friendTrackId, myTrackId);
+    socket.join(`user:${myTrackId}`);
+    console.log(`👁 ${myTrackId} watching ${friendTrackId}`);
+  });
+  socket.on('unwatch:friend', ({ myTrackId, friendTrackId }) => {
+    removeWatcher(friendTrackId, myTrackId);
+  });
   socket.on('conversation:join', (conversationId) => { socket.join(`conversation:${conversationId}`); socket.emit('conversation:joined', { conversationId, success: true }); });
   socket.on('conversation:leave', (conversationId) => { socket.leave(`conversation:${conversationId}`); });
   socket.on('location:update', async (data) => {
