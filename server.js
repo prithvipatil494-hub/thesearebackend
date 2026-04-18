@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
+const NodeCache = require('node-cache');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -912,7 +913,7 @@ async function setupRedisSubscriber() {
 }
 setupRedisSubscriber().catch(console.error);
 
-// ─── Redis location read — replaces locationCache.get ────────────────────────
+// ─── Redis location read ────────────────────────────────────────────────────────
 async function readLocation(trackId) {
   try {
     const raw = await redisData.hGetAll(locKey(trackId));
