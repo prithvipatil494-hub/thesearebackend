@@ -17,7 +17,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-
+    "node-cache": "^5.1.2",
+    "redis": "^4.6.10",
     
     "google-auth-library": "^9.6.3",
     "firebase-admin": "^12.3.0",
