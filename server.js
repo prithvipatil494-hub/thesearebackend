@@ -88,10 +88,6 @@ const BATCH_FLUSH_MS = 800;
 
 const MAPBOX_DIRECTIONS_TOKEN = process.env.MAPBOX_TOKEN;
 
-// Initialize Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
 
 // Raise body size limit to 50 MB to accommodate base64 video payloads
 app.use(express.json({ limit: '50mb' }));
