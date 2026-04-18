@@ -900,6 +900,7 @@ async function setupRedisSubscriber() {
         watchers.forEach(watcherTrackId => {
           io.to(`user:${watcherTrackId}`).emit('friend:location', {
             ...data,
+            trackId,          // explicit trackId for Android client
             lat: data.encryptedCoords ? undefined : data.lat,
             lng: data.encryptedCoords ? undefined : data.lng
           });
@@ -1947,13 +1948,8 @@ app.get('/api/sos/pending/:myTrackId', async (req, res) => {
 
 setInterval(async () => {
   try {
-    const cutoff    = new Date(Date.now() - 24 * 3_600_000);
-    const staleIds  = await Location.find(
-      { timestamp: { $lt: new Date(Date.now() - 30_000) } },
-      'trackId'
-    ).lean();
-    staleIds.forEach(l => kalmanStore.delete(l.trackId));
-
+    const cutoff = new Date(Date.now() - 24 * 3_600_000);
+    // Kalman state is now in Redis with TTL, no manual cleanup needed
     const [dl, dp] = await Promise.all([
       Location.deleteMany({ timestamp: { $lt: cutoff } }),
       PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })
