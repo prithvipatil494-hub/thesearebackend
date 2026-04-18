@@ -11,8 +11,20 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const admin = require('firebase-admin');
+
+// Load Firebase service account with error handling
+let serviceAccount;
+try {
+  serviceAccount = require('./firebase-service-account.json');
+  if (serviceAccount.project_id === 'YOUR_PROJECT_ID') {
+    console.error('❌ Firebase not configured: Please replace firebase-service-account.json with your actual Firebase service account key from Firebase Console > Project Settings > Service Accounts');
+    process.exit(1);
+  }
+} catch (err) {
+  console.error('❌ Firebase service account file not found or invalid. Please create firebase-service-account.json with your Firebase credentials from Firebase Console > Project Settings > Service Accounts');
+  process.exit(1);
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -83,7 +95,11 @@ const batchTimers    = new Map();
 const BATCH_FLUSH_MS = 800;
 
 const MAPBOX_DIRECTIONS_TOKEN = process.env.MAPBOX_TOKEN;
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Initialize Firebase Admin
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 // Raise body size limit to 50 MB to accommodate base64 video payloads
 app.use(express.json({ limit: '50mb' }));
@@ -183,7 +199,7 @@ const userSchema = new mongoose.Schema({
   trackId: { type: String, required: true, index: true },
   displayName: { type: String, default: '' },
   email: { type: String, required: true, unique: true, index: true },
-  passwordHash: { type: String, required: true },
+  passwordHash: { type: String, default: '' }, // Optional for Google auth users
   avatarBase64: { type: String, default: '' },
   friends: { type: [String], default: [] },
   savedFriends: {
@@ -247,7 +263,7 @@ app.get('/api/health', (req, res) => {
 
 // ==================== AUTHENTICATION MIDDLEWARE ====================
 
-function authenticateToken(req, res, next) {
+async function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
@@ -255,130 +271,88 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    req.user = user;
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = {
+      uid: decodedToken.uid,
+      email: decodedToken.email,
+      trackId: decodedToken.trackId || ''
+    };
     next();
-  });
+  } catch (error) {
+    console.error('Token verification error:', error);
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
 }
 
 // ==================== AUTH ROUTES ====================
 
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { email, password, displayName } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
-
-    // Check if user already exists
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
-    if (existingUser) {
-      return res.status(409).json({ error: 'User already exists' });
-    }
-
-    // Generate unique UID
-    const uid = uuidv4();
-
-    // Generate unique trackId
-    let trackId, exists = true;
-    while (exists) {
-      trackId = 'TRK-' + Math.random().toString(36).substr(2, 9).toUpperCase();
-      exists = await Location.findOne({ trackId });
-    }
-
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    // Create user
-    const user = await User.create({
-      uid,
-      trackId,
-      email: email.toLowerCase(),
-      passwordHash,
-      displayName: displayName || '',
-      avatarBase64: '',
-      friends: [],
-      savedFriends: [],
-      blockedUsers: [],
-      blockedBy: [],
-      privacyMode: 'EVERYONE',
-      approvedIds: [],
-      createdAt: new Date(),
-      updatedAt: new Date()
-    });
-
-    // Create location entry
-    await Location.create({
-      trackId,
-      lat: 0,
-      lng: 0,
-      isActive: false
-    });
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { uid: user.uid, email: user.email, trackId: user.trackId },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    console.log(`📝 User registered: ${email} → ${trackId}`);
-    res.json({
-      success: true,
-      token,
-      user: {
-        uid: user.uid,
-        trackId: user.trackId,
-        email: user.email,
-        displayName: user.displayName,
-        avatarBase64: user.avatarBase64
-      }
-    });
-  } catch (error) {
-    console.error('Error registering user:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { idToken } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+    if (!idToken) {
+      return res.status(400).json({ error: 'Firebase ID token is required' });
     }
 
-    // Find user by email
-    const user = await User.findOne({ email: email.toLowerCase() });
+    // Verify Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const firebaseUid = decodedToken.uid;
+    const firebaseEmail = decodedToken.email;
+
+    if (!firebaseEmail) {
+      return res.status(400).json({ error: 'Invalid Firebase token: no email' });
+    }
+
+    // Check if user exists in our database
+    let user = await User.findOne({ uid: firebaseUid });
+
     if (!user) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      // Generate unique trackId
+      let trackId, exists = true;
+      while (exists) {
+        trackId = 'TRK-' + Math.random().toString(36).substr(2, 9).toUpperCase();
+        exists = await Location.findOne({ trackId });
+      }
+
+      // Create user
+      user = await User.create({
+        uid: firebaseUid,
+        trackId,
+        email: firebaseEmail.toLowerCase(),
+        displayName: decodedToken.name || '',
+        avatarBase64: decodedToken.picture || '',
+        friends: [],
+        savedFriends: [],
+        blockedUsers: [],
+        blockedBy: [],
+        privacyMode: 'EVERYONE',
+        approvedIds: [],
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+
+      // Create location entry
+      await Location.create({
+        trackId,
+        lat: 0,
+        lng: 0,
+        isActive: false
+      });
+
+      console.log(`📝 User auto-registered on login: ${firebaseEmail} → ${trackId}`);
     }
 
-    // Verify password
-    const validPassword = await bcrypt.compare(password, user.passwordHash);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+    // Set custom claim for trackId
+    try {
+      await admin.auth().setCustomUserClaims(firebaseUid, { trackId: user.trackId });
+    } catch (claimError) {
+      console.error('Error setting custom claim:', claimError);
     }
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { uid: user.uid, email: user.email, trackId: user.trackId },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    console.log(`🔐 User logged in: ${email}`);
+    console.log(`🔐 User logged in: ${firebaseEmail}`);
     res.json({
       success: true,
-      token,
       user: {
         uid: user.uid,
         trackId: user.trackId,
