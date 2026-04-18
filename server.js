@@ -5,7 +5,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
 const socketIo = require('socket.io');
-const NodeCache = require('node-cache');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -13,6 +12,7 @@ const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
 const { OAuth2Client } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
+const { createClient } = require('redis');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '820558273332-3jmo1on8p0r33m76hoskl8v2v22gq1ng.apps.googleusercontent.com';
@@ -78,14 +78,97 @@ async function deleteFromCloudinary(publicId) {
     }
 }
 
-// ─── Caches ───────────────────────────────────────────────────────────────────
-const locationCache  = new NodeCache({ stdTTL: 4,    checkperiod: 1  });
+// ─── Redis setup ──────────────────────────────────────────────────────────────
+const redisUrl = process.env.REDIS_URL;
+
+// pub  = used for PUBLISH (writing events)
+// sub  = used for SUBSCRIBE (reading events) — must be a separate client
+// data = used for GET/SET/HSET (data reads and writes)
+const redisPub  = createClient({ url: redisUrl });
+const redisSub  = createClient({ url: redisUrl });
+const redisData = createClient({ url: redisUrl });
+
+async function connectRedis() {
+  await Promise.all([redisPub.connect(), redisSub.connect(), redisData.connect()]);
+  console.log('✅ Redis connected (pub/sub/data)');
+}
+connectRedis().catch(err => console.error('❌ Redis connection error:', err));
+
+redisPub.on('error',  e => console.error('Redis pub error:',  e.message));
+redisSub.on('error',  e => console.error('Redis sub error:',  e.message));
+redisData.on('error', e => console.error('Redis data error:', e.message));
+
+// Key helpers
+const locKey     = trackId => `loc:${trackId}`;          // Latest location hash
+const pathKey    = trackId => `path:${trackId}`;          // Recent path (Redis list)
+const chanKey    = trackId => `track:${trackId}`;         // Pub/sub channel
+const kalmanKey  = trackId => `kalman:${trackId}`;        // Kalman state hash
+const TTL_LOC    = 30;    // seconds — location key TTL
+const TTL_PATH   = 86400; // seconds — path key TTL (24h)
+const TTL_KALMAN = 300;   // seconds — Kalman state TTL
+const MAX_PATH_PTS = 2000;
+
+// ─── Redis Kalman state (replaces in-memory kalmanStore Map) ─────────────────
+async function getKalmanState(trackId) {
+  try {
+    const raw = await redisData.hGetAll(kalmanKey(trackId));
+    if (!raw || !raw.latEst) return null;
+    return {
+      latEst: parseFloat(raw.latEst),
+      lngEst: parseFloat(raw.lngEst),
+      latVar: parseFloat(raw.latVar),
+      lngVar: parseFloat(raw.lngVar),
+      lastMs: parseInt(raw.lastMs)
+    };
+  } catch { return null; }
+}
+
+async function setKalmanState(trackId, state) {
+  try {
+    await redisData.hSet(kalmanKey(trackId), {
+      latEst: state.latEst.toString(),
+      lngEst: state.lngEst.toString(),
+      latVar: state.latVar.toString(),
+      lngVar: state.lngVar.toString(),
+      lastMs: state.lastMs.toString()
+    });
+    await redisData.expire(kalmanKey(trackId), TTL_KALMAN);
+  } catch (e) { console.error('Kalman state write error:', e.message); }
+}
+
+async function serverKalman(trackId, lat, lng, accuracyM, nowMs, speedMs = 0) {
+  const Q_BASE = speedMs < 0.3 ? 0.3 : speedMs < 2 ? 1.0 : speedMs < 8 ? 3.0 : 6.0;
+  let state = await getKalmanState(trackId);
+
+  if (!state) {
+    state = { latEst: lat, lngEst: lng, latVar: accuracyM * accuracyM, lngVar: accuracyM * accuracyM, lastMs: nowMs };
+    await setKalmanState(trackId, state);
+    return { lat, lng };
+  }
+
+  const dt  = Math.min((nowMs - state.lastMs) / 1000, 10);
+  const q   = Q_BASE * Q_BASE * dt;
+  state.latVar += q;
+  state.lngVar += q;
+
+  const R    = accuracyM * accuracyM;
+  const kLat = state.latVar / (state.latVar + R);
+  state.latEst = state.latEst + kLat * (lat - state.latEst);
+  state.latVar = (1 - kLat) * state.latVar;
+
+  const kLng = state.lngVar / (state.lngVar + R);
+  state.lngEst = state.lngEst + kLng * (lng - state.lngEst);
+  state.lngVar = (1 - kLng) * state.lngVar;
+
+  state.lastMs = nowMs;
+  await setKalmanState(trackId, state);
+  return { lat: state.latEst, lng: state.lngEst };
+}
+
+// ─── NodeCache for map matching and road snapping (keep these) ───────────────
 const mapMatchCache  = new NodeCache({ stdTTL: 30,   checkperiod: 10 });
 const roadSnapCache  = new NodeCache({ stdTTL: 300,  checkperiod: 60 });
-const batchQueue     = new Map();
 const watcherMap     = new Map(); // trackId → Set<watcherTrackId>
-const batchTimers    = new Map();
-const BATCH_FLUSH_MS = 800;
 
 // Call this when a user subscribes to watch someone
 function addWatcher(ownerTrackId, watcherTrackId) {
@@ -637,165 +720,6 @@ function shouldSnapToRoad(accuracy, speed) {
   return true;
 }
 
-// ─── Batching ─────────────────────────────────────────────────────────────────
-
-function enqueueLocationUpdate(trackId, pointData) {
-  if (!batchQueue.has(trackId)) {
-    batchQueue.set(trackId, []);
-  }
-
-  const queue = batchQueue.get(trackId);
-  queue.push(pointData);
-
-  if (queue.length >= 5) {
-    clearTimeout(batchTimers.get(trackId));
-    batchTimers.delete(trackId);
-    flushBatch(trackId);
-    return;
-  }
-
-  if (!batchTimers.has(trackId)) {
-    const timer = setTimeout(() => {
-      flushBatch(trackId);
-    }, BATCH_FLUSH_MS);
-    batchTimers.set(trackId, timer);
-  }
-}
-
-async function flushBatch(trackId) {
-  batchTimers.delete(trackId);
-  const points = batchQueue.get(trackId) || [];
-  batchQueue.set(trackId, []);
-
-  if (points.length === 0) return;
-
-  try {
-    const best = points.reduce((prev, curr) => {
-      const prevScore = prev.accuracy || 999;
-      const currScore = curr.accuracy || 999;
-      return currScore < prevScore ? curr : prev;
-    });
-
-    const now = new Date();
-
-    let snappedLat = best.lat;
-    let snappedLng = best.lng;
-    let roadName   = '';
-    let snapped    = false;
-
-    if (!best.hasEncrypted && shouldSnapToRoad(best.accuracy, best.speed)) {
-      if (points.length >= 3) {
-        const traced = await snapTraceToRoad(
-          points.map(p => ({
-            lat:       p.lat,
-            lng:       p.lng,
-            timestamp: p.timestamp || now
-          }))
-        );
-        const lastSnapped = traced[traced.length - 1];
-        if (lastSnapped?.snapped) {
-          snappedLat = lastSnapped.lat;
-          snappedLng = lastSnapped.lng;
-          roadName   = lastSnapped.roadName || '';
-          snapped    = true;
-        }
-      } else {
-        const snapResult = await snapToRoad(best.lat, best.lng, best.heading || 0);
-        if (snapResult.snapped && snapResult.confidence > 0.6) {
-          snappedLat = snapResult.lat;
-          snappedLng = snapResult.lng;
-          roadName   = snapResult.roadName || '';
-          snapped    = true;
-        }
-      }
-    }
-
-    const updateFields = {
-      lat:             best.hasEncrypted ? 0 : snappedLat,
-      lng:             best.hasEncrypted ? 0 : snappedLng,
-      speed:           best.speed           || 0,
-      accuracy:        best.accuracy        || 0,
-      heading:         best.heading         || 0,
-      altitude:        best.altitude        || 0,
-      altAccuracy:     best.altAccuracy     || 0,
-      speedAccuracy:   best.speedAccuracy   || 0,
-      headingAccuracy: best.headingAccuracy || 0,
-      provider:        best.provider        || 'gps',
-      timestamp:       now,
-      isActive:        true,
-      encryptedCoords: best.encryptedCoords || '',
-      snapped,
-      roadName
-    };
-
-    await Location.findOneAndUpdate(
-      { trackId },
-      updateFields,
-      { upsert: true, new: true }
-    );
-
-    const pathPoints = points.map(p => ({
-      lat:       p.hasEncrypted ? 0 : p.lat,
-      lng:       p.hasEncrypted ? 0 : p.lng,
-      timestamp: p.timestamp || now,
-      speed:     p.speed     || 0,
-      heading:   p.heading   || 0
-    }));
-
-    PathHistory.findOneAndUpdate(
-      { trackId },
-      {
-        $push: {
-          points: {
-            $each:  pathPoints,
-            $slice: -2000
-          }
-        },
-        lastUpdated: now
-      },
-      { upsert: true }
-    ).catch(() => {});
-
-    locationCache.set(`loc:${trackId}`, {
-      ...updateFields,
-      trackId,
-      isRecent: true,
-      snapped,
-      roadName
-    });
-
-    const updateData = {
-      trackId,
-      speed:           best.speed    || 0,
-      accuracy:        best.accuracy || 0,
-      heading:         best.heading  || 0,
-      altitude:        best.altitude || 0,
-      timestamp:       now,
-      isRecent:        true,
-      snapped,
-      roadName,
-      encryptedCoords: best.encryptedCoords || ''
-    };
-    io.to(`track:${trackId}`).emit('location:updated', updateData);
-
-    // Push to every user who is watching this trackId
-    const watchers = watcherMap.get(trackId);
-    if (watchers && watchers.size > 0) {
-      watchers.forEach(watcherTrackId => {
-        io.to(`user:${watcherTrackId}`).emit('friend:location', {
-          ...updateData,
-          lat: best.hasEncrypted ? undefined : snappedLat,
-          lng: best.hasEncrypted ? undefined : snappedLng,
-          encryptedCoords: best.encryptedCoords || ''
-        });
-      });
-    }
-
-  } catch (err) {
-    console.error(`Batch flush error for ${trackId}:`, err.message);
-  }
-}
-
 // ==================== LOCATION ROUTES ====================
 
 // ─── Dead Reckoning Predictor ─────────────────────────────────────────────────
@@ -804,8 +728,8 @@ function deadReckon(location, nowMs) {
   const lastMs = new Date(location.timestamp).getTime();
   const dtSec  = (nowMs - lastMs) / 1000;
 
-  // Only extrapolate up to 3 seconds — beyond that, data is too stale
-  if (dtSec <= 0 || dtSec > 3 || !location.speed || location.speed < 0.5) {
+  // Only extrapolate up to 8 seconds — beyond that, data is too stale
+  if (dtSec <= 0 || dtSec > 8 || !location.speed || location.speed < 0.5) {
     return { lat: location.lat, lng: location.lng, extrapolated: false };
   }
 
@@ -829,63 +753,200 @@ function deadReckon(location, nowMs) {
   };
 }
 
-const IS_RECENT_MS = 3_000;
+const IS_RECENT_MS = 10_000;
 
-// ─── Server-side Kalman state store (in-memory, resets on restart) ────────────
-const kalmanStore = new Map(); // trackId → { latEst, lngEst, latVar, lngVar, lastMs }
+// ─── Core location write — replaces enqueueLocationUpdate + flushBatch ────────
+async function writeLocation(trackId, point) {
+  const now    = new Date();
+  const nowMs  = now.getTime();
 
-function serverKalman(trackId, lat, lng, accuracyM, nowMs, speedMs = 0) {
-  const Q_BASE = speedMs < 0.3 ? 0.3 : speedMs < 2 ? 1.0 : speedMs < 8 ? 3.0 : 6.0;
-  let state = kalmanStore.get(trackId);
-
-  if (!state) {
-    state = {
-      latEst: lat, lngEst: lng,
-      latVar: accuracyM * accuracyM,
-      lngVar: accuracyM * accuracyM,
-      lastMs: nowMs
-    };
-    kalmanStore.set(trackId, state);
-    return { lat, lng };
+  // 1. Kalman smooth (async, uses Redis state)
+  let processedLat = point.lat;
+  let processedLng = point.lng;
+  if (!point.hasEncrypted && point.lat && point.lng) {
+    const accM    = Math.max(point.accuracy || 20, 1);
+    const smoothed = await serverKalman(trackId, point.lat, point.lng, accM, nowMs, point.speed || 0);
+    processedLat  = smoothed.lat;
+    processedLng  = smoothed.lng;
   }
 
-  const dt  = Math.min((nowMs - state.lastMs) / 1000, 10);
-  const q   = Q_BASE * Q_BASE * dt;
-  state.latVar += q;
-  state.lngVar += q;
+  // 2. Road snap (async, only if worth it)
+  let snappedLat = processedLat;
+  let snappedLng = processedLng;
+  let snapped    = false;
+  let roadName   = '';
 
-  const R    = accuracyM * accuracyM;
-  const kLat = state.latVar / (state.latVar + R);
-  state.latEst = state.latEst + kLat * (lat - state.latEst);
-  state.latVar = (1 - kLat) * state.latVar;
+  if (!point.hasEncrypted && shouldSnapToRoad(point.accuracy, point.speed)) {
+    const snapResult = await snapToRoad(processedLat, processedLng, point.heading || 0);
+    if (snapResult.snapped && snapResult.confidence > 0.6) {
+      snappedLat = snapResult.lat;
+      snappedLng = snapResult.lng;
+      roadName   = snapResult.roadName || '';
+      snapped    = true;
+    }
+  }
 
-  const kLng = state.lngVar / (state.lngVar + R);
-  state.lngEst = state.lngEst + kLng * (lng - state.lngEst);
-  state.lngVar = (1 - kLng) * state.lngVar;
+  const locationData = {
+    trackId,
+    lat:             point.hasEncrypted ? 0 : snappedLat,
+    lng:             point.hasEncrypted ? 0 : snappedLng,
+    speed:           point.speed           || 0,
+    accuracy:        point.accuracy        || 0,
+    heading:         point.heading         || 0,
+    altitude:        point.altitude        || 0,
+    altAccuracy:     point.altAccuracy     || 0,
+    speedAccuracy:   point.speedAccuracy   || 0,
+    headingAccuracy: point.headingAccuracy || 0,
+    provider:        point.provider        || 'gps',
+    encryptedCoords: point.encryptedCoords || '',
+    snapped,
+    roadName,
+    timestamp:       nowMs,
+    isActive:        true
+  };
 
-  state.lastMs = nowMs;
-  kalmanStore.set(trackId, state);
-  return { lat: state.latEst, lng: state.lngEst };
+  // 3. Write to Redis (fast path — ~1ms)
+  await redisData.hSet(locKey(trackId), {
+    trackId,
+    lat:             locationData.lat.toString(),
+    lng:             locationData.lng.toString(),
+    speed:           locationData.speed.toString(),
+    accuracy:        locationData.accuracy.toString(),
+    heading:         locationData.heading.toString(),
+    altitude:        locationData.altitude.toString(),
+    altAccuracy:     locationData.altAccuracy.toString(),
+    speedAccuracy:   locationData.speedAccuracy.toString(),
+    headingAccuracy: locationData.headingAccuracy.toString(),
+    provider:        locationData.provider,
+    encryptedCoords: locationData.encryptedCoords,
+    snapped:         snapped ? '1' : '0',
+    roadName,
+    timestamp:       nowMs.toString(),
+    isActive:        '1'
+  });
+  await redisData.expire(locKey(trackId), TTL_LOC);
+
+  // 4. Publish to Redis channel — triggers subscriber to emit Socket.IO
+  await redisPub.publish(chanKey(trackId), JSON.stringify(locationData));
+
+  // 5. Store path point in Redis list (async, don't await)
+  if (!point.hasEncrypted) {
+    const pathPoint = JSON.stringify({
+      lat: snappedLat, lng: snappedLng,
+      speed: point.speed || 0, heading: point.heading || 0,
+      timestamp: nowMs
+    });
+    redisData.rPush(pathKey(trackId), pathPoint)
+      .then(() => redisData.lTrim(pathKey(trackId), -MAX_PATH_PTS, -1))
+      .then(() => redisData.expire(pathKey(trackId), TTL_PATH))
+      .catch(() => {});
+  }
+
+  // 6. Write to MongoDB in background — don't await, never blocks response
+  setImmediate(async () => {
+    try {
+      await Location.findOneAndUpdate(
+        { trackId },
+        {
+          lat:             locationData.lat,
+          lng:             locationData.lng,
+          speed:           locationData.speed,
+          accuracy:        locationData.accuracy,
+          heading:         locationData.heading,
+          altitude:        locationData.altitude,
+          altAccuracy:     locationData.altAccuracy,
+          speedAccuracy:   locationData.speedAccuracy,
+          headingAccuracy: locationData.headingAccuracy,
+          provider:        locationData.provider,
+          encryptedCoords: locationData.encryptedCoords,
+          snapped,
+          roadName,
+          timestamp:       now,
+          isActive:        true
+        },
+        { upsert: true }
+      );
+
+      if (!point.hasEncrypted) {
+        PathHistory.findOneAndUpdate(
+          { trackId },
+          {
+            $push: { points: { $each: [{ lat: snappedLat, lng: snappedLng, timestamp: now, speed: point.speed || 0, heading: point.heading || 0 }], $slice: -MAX_PATH_PTS } },
+            lastUpdated: now
+          },
+          { upsert: true }
+        ).catch(() => {});
+      }
+    } catch (e) {
+      console.error('Mongo background write error:', e.message);
+    }
+  });
+
+  return locationData;
+}
+
+// ─── Redis subscriber — fans out to Socket.IO rooms ──────────────────────────
+async function setupRedisSubscriber() {
+  await redisSub.pSubscribe('track:*', (message, channel) => {
+    try {
+      const data    = JSON.parse(message);
+      const trackId = channel.replace('track:', '');
+
+      io.to(`track:${trackId}`).emit('location:updated', data);
+
+      const watchers = watcherMap.get(trackId);
+      if (watchers && watchers.size > 0) {
+        watchers.forEach(watcherTrackId => {
+          io.to(`user:${watcherTrackId}`).emit('friend:location', {
+            ...data,
+            lat: data.encryptedCoords ? undefined : data.lat,
+            lng: data.encryptedCoords ? undefined : data.lng
+          });
+        });
+      }
+    } catch (e) {
+      console.error('Redis subscriber parse error:', e.message);
+    }
+  });
+  console.log('✅ Redis subscriber ready — pattern: track:*');
+}
+setupRedisSubscriber().catch(console.error);
+
+// ─── Redis location read — replaces locationCache.get ────────────────────────
+async function readLocation(trackId) {
+  try {
+    const raw = await redisData.hGetAll(locKey(trackId));
+    if (!raw || !raw.trackId) return null;
+    return {
+      trackId:         raw.trackId,
+      lat:             parseFloat(raw.lat)             || 0,
+      lng:             parseFloat(raw.lng)             || 0,
+      speed:           parseFloat(raw.speed)           || 0,
+      accuracy:        parseFloat(raw.accuracy)        || 0,
+      heading:         parseFloat(raw.heading)         || 0,
+      altitude:        parseFloat(raw.altitude)        || 0,
+      altAccuracy:     parseFloat(raw.altAccuracy)     || 0,
+      speedAccuracy:   parseFloat(raw.speedAccuracy)   || 0,
+      headingAccuracy: parseFloat(raw.headingAccuracy) || 0,
+      provider:        raw.provider                    || 'gps',
+      encryptedCoords: raw.encryptedCoords             || '',
+      snapped:         raw.snapped === '1',
+      roadName:        raw.roadName                    || '',
+      timestamp:       parseInt(raw.timestamp)         || 0,
+      isActive:        raw.isActive === '1'
+    };
+  } catch { return null; }
 }
 
 app.post('/api/location/update', authenticateToken, async (req, res) => {
   try {
-    const {
-      trackId, lat, lng, speed, accuracy,
-      heading, altitude, altAccuracy,
-      speedAccuracy, headingAccuracy, provider,
-      encryptedCoords
-    } = req.body;
+    const { trackId, lat, lng, speed, accuracy, heading, altitude,
+            altAccuracy, speedAccuracy, headingAccuracy, provider, encryptedCoords } = req.body;
 
     if (!trackId) return res.status(400).json({ error: 'Missing trackId' });
-
-    // Only allow users to update their own location
-    if (trackId !== req.user.trackId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    if (trackId !== req.user.trackId) return res.status(403).json({ error: 'Access denied' });
 
     const hasEncrypted = !!(encryptedCoords && encryptedCoords.length > 0);
-
     if (!hasEncrypted) {
       if (lat === undefined || lng === undefined)
         return res.status(400).json({ error: 'Missing lat/lng or encryptedCoords' });
@@ -893,37 +954,20 @@ app.post('/api/location/update', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'Invalid coordinates' });
     }
 
-    let processedLat = lat || 0;
-    let processedLng = lng || 0;
-
-    if (!hasEncrypted) {
-      const nowMs   = Date.now();
-      const accM    = Math.max(accuracy || 20, 1);
-      const smoothed = serverKalman(trackId, lat, lng, accM, nowMs, speed || 0);
-      processedLat  = smoothed.lat;
-      processedLng  = smoothed.lng;
-    }
-
-    enqueueLocationUpdate(trackId, {
-      lat:             processedLat,
-      lng:             processedLng,
-      speed:           speed           || 0,
-      accuracy:        accuracy        || 0,
-      heading:         heading         || 0,
-      altitude:        altitude        || 0,
-      altAccuracy:     altAccuracy     || 0,
-      speedAccuracy:   speedAccuracy   || 0,
-      headingAccuracy: headingAccuracy || 0,
-      provider:        provider        || 'gps',
+    await writeLocation(trackId, {
+      lat: lat || 0, lng: lng || 0, speed: speed || 0,
+      accuracy: accuracy || 0, heading: heading || 0,
+      altitude: altitude || 0, altAccuracy: altAccuracy || 0,
+      speedAccuracy: speedAccuracy || 0, headingAccuracy: headingAccuracy || 0,
+      provider: provider || 'gps',
       encryptedCoords: encryptedCoords || '',
       hasEncrypted,
-      timestamp:       new Date()
+      timestamp: new Date()
     });
 
-    res.json({ success: true, queued: true });
-
+    res.json({ success: true });
   } catch (error) {
-    console.error('Error queuing location update:', error);
+    console.error('Error in location update:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -934,9 +978,6 @@ app.get('/api/location/:trackId', async (req, res) => {
     const { requesterId } = req.query;
     if (!trackId) return res.status(400).json({ error: 'Track ID required' });
 
-    const cacheKey    = `loc:${trackId}`;
-    const cachedLoc   = locationCache.get(cacheKey);
-
     async function checkPrivacy(ownerTrackId) {
       if (!requesterId || requesterId === ownerTrackId) return null;
       const owner = await User.findOne(
@@ -945,78 +986,54 @@ app.get('/api/location/:trackId', async (req, res) => {
       ).lean();
       if (!owner) return null;
       if ((owner.blockedUsers || []).includes(requesterId))
-        return { error: 'blocked', notFound: true };
+        return { error: 'blocked' };
       if (owner.privacyMode === 'CONTACTS_ONLY' &&
           !(owner.friends || []).includes(requesterId))
-        return { error: 'privacy', notFound: true };
+        return { error: 'privacy' };
       if (owner.privacyMode === 'SELECTED' &&
           !(owner.approvedIds || []).includes(requesterId))
-        return { error: 'privacy', notFound: true };
+        return { error: 'privacy' };
       return null;
     }
 
-    if (cachedLoc) {
-      const privacyErr = await checkPrivacy(trackId);
-      if (privacyErr) return res.status(403).json(privacyErr);
+    const IS_RECENT_MS = 10_000;
+    const nowMs = Date.now();
 
-      const nowMs    = Date.now();
-      const isRecent = cachedLoc.timestamp > new Date(nowMs - 3_000);
+    // 1. Try Redis first (fast path)
+    let location = await readLocation(trackId);
 
-      let outLat = cachedLoc.lat, outLng = cachedLoc.lng, extrapolated = false;
-      if (!cachedLoc.encryptedCoords && isRecent && (cachedLoc.speed || 0) > 0.3) {
-        const dr = deadReckon(cachedLoc, nowMs);
-        outLat       = dr.lat;
-        outLng       = dr.lng;
-        extrapolated = dr.extrapolated;
-      }
-
-      return res.json({
-        ...cachedLoc,
-        lat:         outLat,
-        lng:         outLng,
-        isRecent,
-        extrapolated,
-        fromCache:   true
-      });
+    if (!location) {
+      // 2. Fall back to MongoDB
+      const dbLoc = await Location.findOne({ trackId }).lean();
+      if (!dbLoc) return res.json({ trackId, isRecent: false, notFound: true });
+      location = {
+        trackId:         dbLoc.trackId,
+        lat:             dbLoc.lat,
+        lng:             dbLoc.lng,
+        speed:           dbLoc.speed || 0,
+        accuracy:        dbLoc.accuracy || 0,
+        heading:         dbLoc.heading || 0,
+        altitude:        dbLoc.altitude || 0,
+        snapped:         dbLoc.snapped || false,
+        roadName:        dbLoc.roadName || '',
+        timestamp:       new Date(dbLoc.timestamp).getTime(),
+        isActive:        dbLoc.isActive,
+        encryptedCoords: dbLoc.encryptedCoords || ''
+      };
     }
-
-    const location = await Location.findOne({ trackId });
-    if (!location) return res.json({ trackId, isRecent: false, notFound: true });
 
     const privacyErr = await checkPrivacy(trackId);
     if (privacyErr) return res.status(403).json(privacyErr);
 
-    const nowMs    = Date.now();
-    const isRecent = location.timestamp > new Date(nowMs - 3_000);
-
+    const isRecent = (nowMs - location.timestamp) < IS_RECENT_MS;
     let outLat = location.lat, outLng = location.lng, extrapolated = false;
+
     if (!location.encryptedCoords && isRecent && location.speed > 0.3) {
-      const dr = deadReckon(location, nowMs);
-      outLat       = dr.lat;
-      outLng       = dr.lng;
-      extrapolated = dr.extrapolated;
+      const dr = deadReckon({ ...location, timestamp: new Date(location.timestamp) }, nowMs);
+      outLat = dr.lat; outLng = dr.lng; extrapolated = dr.extrapolated;
     }
 
-    const response = {
-      trackId:         location.trackId,
-      lat:             outLat,
-      lng:             outLng,
-      speed:           location.speed,
-      accuracy:        location.accuracy,
-      heading:         location.heading  || 0,
-      altitude:        location.altitude || 0,
-      snapped:         location.snapped  || false,
-      roadName:        location.roadName || '',
-      timestamp:       location.timestamp,
-      isActive:        location.isActive,
-      isRecent,
-      extrapolated,
-      encryptedCoords: location.encryptedCoords || ''
-    };
-
-    locationCache.set(cacheKey, response);
-    res.json(response);
-
+    res.json({ ...location, lat: outLat, lng: outLng, isRecent, extrapolated });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1030,71 +1047,53 @@ app.get('/api/locations/bulk', async (req, res) => {
 
     const trackIds = ids.split(',').map(s => s.trim()).filter(Boolean).slice(0, 8);
     const nowMs    = Date.now();
-    const results  = [];
-    const cacheMissIds = [];
+    const IS_RECENT_MS = 10_000;
 
-    for (const trackId of trackIds) {
-      const cached = locationCache.get(`loc:${trackId}`);
-      if (cached) {
-        results.push({ trackId, cached, fromCache: true });
-      } else {
-        cacheMissIds.push(trackId);
-      }
-    }
+    // Batch read from Redis with Promise.all
+    const redisResults = await Promise.all(trackIds.map(id => readLocation(id)));
 
-    if (cacheMissIds.length > 0) {
-      const dbLocs = await Location.find(
-        { trackId: { $in: cacheMissIds } }
-      ).lean();
-      for (const loc of dbLocs) {
-        locationCache.set(`loc:${loc.trackId}`, loc);
-        results.push({ trackId: loc.trackId, cached: loc, fromCache: false });
-      }
-    }
+    // For any cache miss, fall back to Mongo
+    const missingIds = trackIds.filter((id, i) => !redisResults[i]);
+    const dbLocs = missingIds.length > 0
+      ? await Location.find({ trackId: { $in: missingIds } }).lean()
+      : [];
 
-    const formatted = await Promise.all(results.map(async ({ trackId, cached: loc }) => {
+    const dbMap = new Map(dbLocs.map(l => [l.trackId, l]));
+
+    const locations = trackIds.map((id, i) => {
+      if (redisResults[i]) return redisResults[i];
+      const db = dbMap.get(id);
+      if (!db) return null;
+      return {
+        trackId: db.trackId, lat: db.lat, lng: db.lng,
+        speed: db.speed || 0, accuracy: db.accuracy || 0,
+        heading: db.heading || 0, altitude: db.altitude || 0,
+        snapped: db.snapped || false, roadName: db.roadName || '',
+        timestamp: new Date(db.timestamp).getTime(),
+        encryptedCoords: db.encryptedCoords || ''
+      };
+    });
+
+    const formatted = await Promise.all(locations.map(async (loc, i) => {
+      const trackId = trackIds[i];
+      if (!loc) return { trackId, notFound: true };
+
       if (requesterId && requesterId !== trackId) {
-        const owner = await User.findOne(
-          { trackId },
-          'privacyMode approvedIds friends blockedUsers'
-        ).lean();
+        const owner = await User.findOne({ trackId }, 'privacyMode approvedIds friends blockedUsers').lean();
         if (owner) {
-          if ((owner.blockedUsers || []).includes(requesterId))
-            return { trackId, blocked: true };
-          if (owner.privacyMode === 'CONTACTS_ONLY' &&
-              !(owner.friends || []).includes(requesterId))
-            return { trackId, privacy: true };
-          if (owner.privacyMode === 'SELECTED' &&
-              !(owner.approvedIds || []).includes(requesterId))
-            return { trackId, privacy: true };
+          if ((owner.blockedUsers || []).includes(requesterId)) return { trackId, blocked: true };
+          if (owner.privacyMode === 'CONTACTS_ONLY' && !(owner.friends || []).includes(requesterId)) return { trackId, privacy: true };
+          if (owner.privacyMode === 'SELECTED'       && !(owner.approvedIds || []).includes(requesterId)) return { trackId, privacy: true };
         }
       }
 
-      const isRecent = new Date(loc.timestamp) > new Date(nowMs - 3_000);
+      const isRecent = (nowMs - loc.timestamp) < IS_RECENT_MS;
       let outLat = loc.lat, outLng = loc.lng, extrapolated = false;
-
-      if (!loc.encryptedCoords && isRecent && (loc.speed || 0) > 0.3) {
-        const dr = deadReckon(loc, nowMs);
-        outLat       = dr.lat;
-        outLng       = dr.lng;
-        extrapolated = dr.extrapolated;
+      if (!loc.encryptedCoords && isRecent && loc.speed > 0.3) {
+        const dr = deadReckon({ ...loc, timestamp: new Date(loc.timestamp) }, nowMs);
+        outLat = dr.lat; outLng = dr.lng; extrapolated = dr.extrapolated;
       }
-
-      return {
-        trackId,
-        lat:             outLat,
-        lng:             outLng,
-        speed:           loc.speed    || 0,
-        accuracy:        loc.accuracy || 0,
-        heading:         loc.heading  || 0,
-        altitude:        loc.altitude || 0,
-        snapped:         loc.snapped  || false,
-        roadName:        loc.roadName || '',
-        timestamp:       loc.timestamp,
-        isRecent,
-        extrapolated,
-        encryptedCoords: loc.encryptedCoords || ''
-      };
+      return { ...loc, lat: outLat, lng: outLng, isRecent, extrapolated };
     }));
 
     res.json(formatted);
@@ -1104,59 +1103,52 @@ app.get('/api/locations/bulk', async (req, res) => {
 });
 
 // POST /api/location/batch — Android sends array of points, server processes as one batch
-app.post('/api/location/batch', async (req, res) => {
+app.post('/api/location/batch', authenticateToken, async (req, res) => {
   try {
     const { trackId, points } = req.body;
     if (!trackId || !Array.isArray(points) || points.length === 0)
       return res.status(400).json({ error: 'trackId and points[] required' });
-    if (points.length > 20)
-      return res.status(400).json({ error: 'Max 20 points per batch' });
+    if (trackId !== req.user.trackId) return res.status(403).json({ error: 'Access denied' });
+    if (points.length > 20) return res.status(400).json({ error: 'Max 20 points per batch' });
 
-    const nowMs = Date.now();
+    // Write only the best point (lowest accuracy value = most accurate) to Redis immediately
+    // Write all to Mongo in background
+    const best = points.reduce((a, b) => (b.accuracy || 999) < (a.accuracy || 999) ? b : a);
+    const hasEncrypted = !!(best.encryptedCoords && best.encryptedCoords.length > 0);
 
-    for (const pt of points) {
-      const hasEncrypted = !!(pt.encryptedCoords && pt.encryptedCoords.length > 0);
-      let processedLat   = pt.lat || 0;
-      let processedLng   = pt.lng || 0;
+    await writeLocation(trackId, { ...best, hasEncrypted });
 
-      if (!hasEncrypted && pt.lat && pt.lng) {
-        const accM    = Math.max(pt.accuracy || 20, 1);
-        const smoothed = serverKalman(trackId, pt.lat, pt.lng, accM, nowMs, pt.speed || 0);
-        processedLat  = smoothed.lat;
-        processedLng  = smoothed.lng;
+    // Background: write remaining points to Mongo path history only
+    setImmediate(async () => {
+      const now = new Date();
+      const pathPoints = points.map(p => ({
+        lat: p.lat || 0, lng: p.lng || 0,
+        timestamp: new Date(p.timestamp || now),
+        speed: p.speed || 0, heading: p.heading || 0
+      })).filter(p => p.lat !== 0 || p.lng !== 0);
+
+      if (pathPoints.length > 0) {
+        PathHistory.findOneAndUpdate(
+          { trackId },
+          { $push: { points: { $each: pathPoints, $slice: -MAX_PATH_PTS } }, lastUpdated: now },
+          { upsert: true }
+        ).catch(() => {});
       }
+    });
 
-      enqueueLocationUpdate(trackId, {
-        lat:             processedLat,
-        lng:             processedLng,
-        speed:           pt.speed           || 0,
-        accuracy:        pt.accuracy        || 0,
-        heading:         pt.heading         || 0,
-        altitude:        pt.altitude        || 0,
-        altAccuracy:     pt.altAccuracy     || 0,
-        speedAccuracy:   pt.speedAccuracy   || 0,
-        headingAccuracy: pt.headingAccuracy || 0,
-        provider:        pt.provider        || 'gps',
-        encryptedCoords: pt.encryptedCoords || '',
-        hasEncrypted,
-        timestamp:       new Date(pt.timestamp || nowMs)
-      });
-    }
-
-    res.json({ success: true, queued: points.length });
+    res.json({ success: true, processed: points.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/cache/stats', (req, res) => {
-  res.json({
-    locationCache:  locationCache.getStats(),
-    mapMatchCache:  mapMatchCache.getStats(),
-    roadSnapCache:  roadSnapCache.getStats(),
-    batchQueueSize: [...batchQueue.values()].reduce((a, b) => a + b.length, 0),
-    kalmanStoreSize: kalmanStore.size
-  });
+app.get('/api/cache/stats', async (req, res) => {
+  try {
+    const info = await redisData.info('stats');
+    res.json({ redis: info, timestamp: new Date() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 function bearing(from, to) {
@@ -1183,6 +1175,18 @@ app.get('/api/path/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
     const { hours = 2 } = req.query;
+
+    // Try Redis first
+    const raw = await redisData.lRange(pathKey(trackId), -MAX_PATH_PTS, -1);
+    if (raw && raw.length > 0) {
+      const cutoff = Date.now() - parseInt(hours) * 3_600_000;
+      const points = raw
+        .map(p => { try { return JSON.parse(p); } catch { return null; } })
+        .filter(p => p && p.timestamp > cutoff);
+      return res.json({ points });
+    }
+
+    // Fall back to Mongo
     const pathHistory = await PathHistory.findOne({ trackId });
     if (!pathHistory) return res.json({ points: [] });
     const timeAgo      = new Date(Date.now() - parseInt(hours) * 60 * 60 * 1000);
