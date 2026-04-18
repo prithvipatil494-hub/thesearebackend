@@ -11,20 +11,12 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
-const admin = require('firebase-admin');
+const { OAuth2Client } = require('google-auth-library');
+const jwt = require('jsonwebtoken');
 
-// Load Firebase service account with error handling
-let serviceAccount;
-try {
-  serviceAccount = require('./firebase-service-account.json');
-  if (serviceAccount.project_id === 'YOUR_PROJECT_ID') {
-    console.error('❌ Firebase not configured: Please replace firebase-service-account.json with your actual Firebase service account key from Firebase Console > Project Settings > Service Accounts');
-    process.exit(1);
-  }
-} catch (err) {
-  console.error('❌ Firebase service account file not found or invalid. Please create firebase-service-account.json with your Firebase credentials from Firebase Console > Project Settings > Service Accounts');
-  process.exit(1);
-}
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '820558273332-3jmo1on8p0r33m76hoskl8v2v22gq1ng.apps.googleusercontent.com';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 const app = express();
 const server = http.createServer(app);
@@ -272,12 +264,8 @@ async function authenticateToken(req, res, next) {
   }
 
   try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    req.user = {
-      uid: decodedToken.uid,
-      email: decodedToken.email,
-      trackId: decodedToken.trackId || ''
-    };
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
     next();
   } catch (error) {
     console.error('Token verification error:', error);
@@ -287,25 +275,30 @@ async function authenticateToken(req, res, next) {
 
 // ==================== AUTH ROUTES ====================
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/google', async (req, res) => {
   try {
     const { idToken } = req.body;
 
     if (!idToken) {
-      return res.status(400).json({ error: 'Firebase ID token is required' });
+      return res.status(400).json({ error: 'Google ID token is required' });
     }
 
-    // Verify Firebase ID token
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const firebaseUid = decodedToken.uid;
-    const firebaseEmail = decodedToken.email;
+    // Verify Google ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_CLIENT_ID
+    });
 
-    if (!firebaseEmail) {
-      return res.status(400).json({ error: 'Invalid Firebase token: no email' });
+    const payload = ticket.getPayload();
+    const googleUid = payload.sub;
+    const googleEmail = payload.email;
+
+    if (!googleEmail) {
+      return res.status(400).json({ error: 'Invalid Google token: no email' });
     }
 
     // Check if user exists in our database
-    let user = await User.findOne({ uid: firebaseUid });
+    let user = await User.findOne({ uid: googleUid });
 
     if (!user) {
       // Generate unique trackId
@@ -317,11 +310,11 @@ app.post('/api/auth/login', async (req, res) => {
 
       // Create user
       user = await User.create({
-        uid: firebaseUid,
+        uid: googleUid,
         trackId,
-        email: firebaseEmail.toLowerCase(),
-        displayName: decodedToken.name || '',
-        avatarBase64: decodedToken.picture || '',
+        email: googleEmail.toLowerCase(),
+        displayName: payload.name || '',
+        avatarBase64: payload.picture || '',
         friends: [],
         savedFriends: [],
         blockedUsers: [],
@@ -340,19 +333,20 @@ app.post('/api/auth/login', async (req, res) => {
         isActive: false
       });
 
-      console.log(`📝 User auto-registered on login: ${firebaseEmail} → ${trackId}`);
+      console.log(`📝 User auto-registered on Google login: ${googleEmail} → ${trackId}`);
     }
 
-    // Set custom claim for trackId
-    try {
-      await admin.auth().setCustomUserClaims(firebaseUid, { trackId: user.trackId });
-    } catch (claimError) {
-      console.error('Error setting custom claim:', claimError);
-    }
+    // Generate JWT token
+    const token = jwt.sign(
+      { uid: user.uid, email: user.email, trackId: user.trackId },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
-    console.log(`🔐 User logged in: ${firebaseEmail}`);
+    console.log(`🔐 User logged in via Google: ${googleEmail}`);
     res.json({
       success: true,
+      token,
       user: {
         uid: user.uid,
         trackId: user.trackId,
@@ -362,8 +356,8 @@ app.post('/api/auth/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error logging in user:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Error with Google authentication:', error);
+    res.status(500).json({ error: 'Google authentication failed' });
   }
 });
 
