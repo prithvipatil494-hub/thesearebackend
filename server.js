@@ -258,15 +258,17 @@ async function authenticateToken(req, res, next) {
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
   if (!token) {
+    console.log('❌ No token provided in request');
     return res.status(401).json({ error: 'Access token required' });
   }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    console.log('✅ Token decoded successfully for uid:', decoded.uid);
     req.user = decoded;
     next();
   } catch (error) {
-    console.error('Token verification error:', error);
+    console.error('❌ Token verification error:', error.message);
     return res.status(403).json({ error: 'Invalid or expired token' });
   }
 }
@@ -369,11 +371,14 @@ app.post('/api/auth/google', async (req, res) => {
 
 app.post('/api/auth/verify-token', authenticateToken, async (req, res) => {
   try {
+    console.log('🔍 Token verification request for uid:', req.user?.uid);
     const user = await User.findOne({ uid: req.user.uid });
     if (!user) {
+      console.log('❌ User not found for uid:', req.user?.uid);
       return res.status(404).json({ error: 'User not found' });
     }
 
+    console.log('✅ Token verification successful for user:', user.email);
     res.json({
       success: true,
       user: {
@@ -385,7 +390,7 @@ app.post('/api/auth/verify-token', authenticateToken, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error verifying token:', error);
+    console.error('❌ Error verifying token:', error);
     res.status(500).json({ error: error.message });
   }
 });
