@@ -13,7 +13,7 @@ const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
 const { OAuth2Client } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
-const { createClient } = require('redis');
+// const { createClient } = require('redis'); // DISABLED - using MongoDB instead
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '820558273332-3jmo1on8p0r33m76hoskl8v2v22gq1ng.apps.googleusercontent.com';
@@ -79,9 +79,11 @@ async function deleteFromCloudinary(publicId) {
     }
 }
 
-// ─── Redis setup ──────────────────────────────────────────────────────────────
-const redisUrl = process.env.REDIS_URL;
+// ─── Redis setup (DISABLED - using MongoDB instead) ─────────────────────────────
+// const redisUrl = process.env.REDIS_URL;
 
+// ─── Redis DISABLED - using MongoDB instead ───────────────────────────────────
+/*
 // pub  = used for PUBLISH (writing events)
 // sub  = used for SUBSCRIBE (reading events) — must be a separate client
 // data = used for GET/SET/HSET (data reads and writes)
@@ -107,29 +109,22 @@ const kalmanKey  = trackId => `kalman:${trackId}`;        // Kalman state hash
 const TTL_LOC    = 60;     // seconds — location key TTL (was 30)
 const TTL_PATH   = 86400;  // seconds — path key TTL (24h)
 const TTL_KALMAN = 1800;   // seconds — Kalman state TTL (30min, was 5min)
+*/
 const MAX_PATH_PTS = 2000;
 
-// ─── Redis Kalman state (replaces in-memory kalmanStore Map) ─────────────────
+// ─── In-memory Kalman state (loses state on server restart) ─────────────────────
+const kalmanStore = new Map(); // trackId -> { latEst, lngEst, latVar, lngVar, lastMs, lastHeading }
+
 async function getKalmanState(trackId) {
-  try {
-    const raw = await redisData.hGetAll(kalmanKey(trackId));
-    if (raw && raw.latEst) {
-      return {
-        latEst: parseFloat(raw.latEst),
-        lngEst: parseFloat(raw.lngEst),
-        latVar: parseFloat(raw.latVar),
-        lngVar: parseFloat(raw.lngVar),
-        lastMs: parseInt(raw.lastMs),
-        lastHeading: raw.lastHeading ? parseFloat(raw.lastHeading) : null
-      };
-    }
-  } catch { /* fall through to MongoDB */ }
+  // Check in-memory store first
+  const state = kalmanStore.get(trackId);
+  if (state) return state;
 
   // Fallback: rehydrate from last MongoDB location
   try {
     const lastLoc = await Location.findOne({ trackId }).lean();
     if (lastLoc && lastLoc.accuracy) {
-      const state = {
+      const newState = {
         latEst: lastLoc.lat,
         lngEst: lastLoc.lng,
         latVar: lastLoc.accuracy * lastLoc.accuracy,
@@ -137,10 +132,10 @@ async function getKalmanState(trackId) {
         lastMs: new Date(lastLoc.timestamp).getTime(),
         lastHeading: lastLoc.heading || null
       };
-      // Restore to Redis for next time
-      await setKalmanState(trackId, state);
+      // Store in memory
+      kalmanStore.set(trackId, newState);
       console.log(`🔄 Kalman rehydrated from MongoDB for ${trackId}`);
-      return state;
+      return newState;
     }
   } catch (e) { console.error('Kalman MongoDB rehydration error:', e.message); }
 
@@ -148,17 +143,8 @@ async function getKalmanState(trackId) {
 }
 
 async function setKalmanState(trackId, state) {
-  try {
-    await redisData.hSet(kalmanKey(trackId), {
-      latEst: state.latEst.toString(),
-      lngEst: state.lngEst.toString(),
-      latVar: state.latVar.toString(),
-      lngVar: state.lngVar.toString(),
-      lastMs: state.lastMs.toString(),
-      lastHeading: (state.lastHeading !== null && state.lastHeading !== undefined) ? state.lastHeading.toString() : ''
-    });
-    await redisData.expire(kalmanKey(trackId), TTL_KALMAN);
-  } catch (e) { console.error('Kalman state write error:', e.message); }
+  // Store in memory only (loses state on server restart)
+  kalmanStore.set(trackId, state);
 }
 
 async function serverKalman(trackId, lat, lng, accuracyM, nowMs, speedMs = 0, heading = null) {
@@ -399,8 +385,7 @@ app.get('/api/warmup', (req, res) => {
     try {
       await Promise.all([
         User.findOne({}).lean(),
-        Location.findOne({}).lean(),
-        redisData.ping()
+        Location.findOne({}).lean()
       ]);
     } catch (_) {}
   });
@@ -779,6 +764,7 @@ async function snapTraceToRoad(points) {
 function shouldSnapToRoad(accuracy, speed) {
   if (accuracy > 50)  return false;
   if (speed > 55)     return false;
+  if (speed < 0.3)    return false;  // Don't snap if not actually moving
   return true;
 }
 
@@ -883,7 +869,10 @@ setInterval(async () => {
   }
 }, 30_000);
 
-// ─── Location Engine: 10Hz interpolation for smooth position updates ─────────────
+// ─── Location Engine: DISABLED - now using immediate Socket.IO broadcast ─────────
+// Kalman filtering happens on server (for MongoDB) and Android (for display)
+// No server-side interpolation needed
+/*
 // Interpolation helper: extrapolate position given lat/lng, distance (m), heading (deg)
 function reckon(lat, lng, distM, heading) {
   const R = 6_371_000; // Earth radius in meters
@@ -902,8 +891,8 @@ class LocationEngine {
     this.states = new Map(); // trackId -> { real, velocity, heading, lastRealTime, confidence }
     this.streamKey = trackId => `stream:${trackId}`;
 
-    // 10Hz interpolation tick (100ms intervals)
-    this.tickInterval = setInterval(() => this.tick(), 100);
+    // 5Hz interpolation tick (200ms intervals) - matches Android polling frequency
+    this.tickInterval = setInterval(() => this.tick(), 200);
   }
 
   // Called when real GPS update arrives
@@ -919,24 +908,11 @@ class LocationEngine {
       confidence: 1.0
     });
 
-    // Broadcast real point immediately
+    // Broadcast real point immediately to Android via Socket.IO
     this.broadcast(trackId, { ...point, isReal: true });
-
-    // Store to Redis Stream for history (async, don't await)
-    this.redis.xAdd(this.streamKey(trackId), '*', {
-      lat: point.lat.toString(),
-      lng: point.lng.toString(),
-      speed: (point.speed || 0).toString(),
-      heading: (point.heading || 0).toString(),
-      accuracy: (point.accuracy || 0).toString(),
-      ts: nowMs.toString()
-    }).catch(() => {});
-
-    // Trim stream to last 1000 points (~5-10 min history)
-    this.redis.xTrim(this.streamKey(trackId), 'MAXLEN', '~', 1000).catch(() => {});
   }
 
-  // 10Hz tick: interpolate positions between real GPS updates
+  // 5Hz tick: interpolate positions between real GPS updates
   tick() {
     const nowMs = Date.now();
 
@@ -984,6 +960,7 @@ class LocationEngine {
 
 // Initialize LocationEngine
 const locationEngine = new LocationEngine(redisData, io);
+*/
 
 // ─── Core location write — replaces enqueueLocationUpdate + flushBatch ────────
 async function writeLocation(trackId, point) {
@@ -1006,7 +983,7 @@ async function writeLocation(trackId, point) {
     }
   }
 
-  // 1. Kalman smooth (async, uses Redis state)
+  // 1. Kalman smooth (async, uses in-memory state)
   let processedLat = point.lat;
   let processedLng = point.lng;
   if (!point.hasEncrypted && point.lat && point.lng) {
@@ -1024,7 +1001,7 @@ async function writeLocation(trackId, point) {
 
   if (!point.hasEncrypted && shouldSnapToRoad(point.accuracy, point.speed)) {
     const snapResult = await snapToRoad(processedLat, processedLng, point.heading || 0);
-    if (snapResult.snapped && (snapResult.confidence > 0.4 || (point.accuracy || 999) < 15)) {
+    if (snapResult.snapped && (snapResult.confidence > 0.2 || (point.accuracy || 999) < 20)) {
       snappedLat = snapResult.lat;
       snappedLng = snapResult.lng;
       roadName   = snapResult.roadName || '';
@@ -1051,62 +1028,58 @@ async function writeLocation(trackId, point) {
     isActive:        true
   };
 
-  // 3. Write to Redis (fast path — ~1ms)
-  await redisData.hSet(locKey(trackId), {
-    trackId,
-    lat:             locationData.lat.toString(),
-    lng:             locationData.lng.toString(),
-    speed:           locationData.speed.toString(),
-    accuracy:        locationData.accuracy.toString(),
-    heading:         locationData.heading.toString(),
-    altitude:        locationData.altitude.toString(),
-    altAccuracy:     locationData.altAccuracy.toString(),
-    speedAccuracy:   locationData.speedAccuracy.toString(),
-    headingAccuracy: locationData.headingAccuracy.toString(),
-    provider:        locationData.provider,
-    encryptedCoords: locationData.encryptedCoords,
-    snapped:         snapped ? '1' : '0',
-    roadName,
-    timestamp:       nowMs.toString(),
-    isActive:        '1'
-  });
-  await redisData.expire(locKey(trackId), TTL_LOC);
-
-  // 4. Publish to Redis channel — triggers subscriber to emit Socket.IO
-  await redisPub.publish(chanKey(trackId), JSON.stringify(locationData));
-
-  // 5. Store path point in Redis list (async, don't await)
+  // 3. Store path point in MongoDB PathHistory (async, don't await)
   if (!point.hasEncrypted) {
-    const pathPoint = JSON.stringify({
-      lat: snappedLat, lng: snappedLng,
-      speed: point.speed || 0, heading: point.heading || 0,
-      timestamp: nowMs
-    });
-    redisData.rPush(pathKey(trackId), pathPoint)
-      .then(() => redisData.lTrim(pathKey(trackId), -MAX_PATH_PTS, -1))
-      .then(() => redisData.expire(pathKey(trackId), TTL_PATH))
-      .catch(() => {});
+    PathHistory.findOneAndUpdate(
+      { trackId },
+      {
+        $push: {
+          points: {
+            $each: [{ lat: snappedLat, lng: snappedLng, speed: point.speed || 0, heading: point.heading || 0, timestamp: nowMs }],
+            $slice: -MAX_PATH_PTS
+          }
+        },
+        $set: { lastUpdated: now }
+      },
+      { upsert: true }
+    ).catch(() => {});
   }
 
-  // 6. Enqueue for batched MongoDB write (30s queue, never blocks response)
+  // 5. Enqueue for batched MongoDB write (30s queue, never blocks response)
   enqueueMongoWrite(trackId, locationData, point.hasEncrypted ? null : { lat: snappedLat, lng: snappedLng, timestamp: now, speed: point.speed || 0, heading: point.heading || 0 });
 
-  // 7. Trigger LocationEngine for 10Hz interpolation (broadcasts via Socket.IO)
+  // 6. Broadcast Kalman-filtered data immediately via Socket.IO (no interpolation)
   if (!point.hasEncrypted) {
-    locationEngine.onGpsUpdate(trackId, {
+    const broadcastData = {
+      trackId,
       lat: snappedLat,
       lng: snappedLng,
       speed: point.speed || 0,
       heading: point.heading || 0,
       accuracy: point.accuracy || 0,
-      timestamp: nowMs
-    });
+      timestamp: nowMs,
+      isRecent: true
+    };
+    io.to(`track:${trackId}`).emit('location:updated', broadcastData);
+
+    // Also broadcast to watchers
+    const watchers = watcherMap.get(trackId);
+    if (watchers && watchers.size > 0) {
+      watchers.forEach(watcherTrackId => {
+        io.to(`user:${watcherTrackId}`).emit('friend:location', {
+          ...broadcastData,
+          lat: point.encryptedCoords ? undefined : broadcastData.lat,
+          lng: point.encryptedCoords ? undefined : broadcastData.lng
+        });
+      });
+    }
   }
 
   return locationData;
 }
 
-// ─── Redis subscriber — fans out to Socket.IO rooms ──────────────────────────
+// ─── Redis subscriber — DISABLED - now broadcasting directly in writeLocation ────
+/*
 async function setupRedisSubscriber() {
   await redisSub.pSubscribe('track:*', (message, channel) => {
     try {
@@ -1133,29 +1106,30 @@ async function setupRedisSubscriber() {
   console.log('✅ Redis subscriber ready — pattern: track:*');
 }
 setupRedisSubscriber().catch(console.error);
+*/
 
-// ─── Redis location read ────────────────────────────────────────────────────────
+// ─── MongoDB location read ──────────────────────────────────────────────────────
 async function readLocation(trackId) {
   try {
-    const raw = await redisData.hGetAll(locKey(trackId));
-    if (!raw || !raw.trackId) return null;
+    const loc = await Location.findOne({ trackId }).lean();
+    if (!loc) return null;
     return {
-      trackId:         raw.trackId,
-      lat:             parseFloat(raw.lat)             || 0,
-      lng:             parseFloat(raw.lng)             || 0,
-      speed:           parseFloat(raw.speed)           || 0,
-      accuracy:        parseFloat(raw.accuracy)        || 0,
-      heading:         parseFloat(raw.heading)         || 0,
-      altitude:        parseFloat(raw.altitude)        || 0,
-      altAccuracy:     parseFloat(raw.altAccuracy)     || 0,
-      speedAccuracy:   parseFloat(raw.speedAccuracy)   || 0,
-      headingAccuracy: parseFloat(raw.headingAccuracy) || 0,
-      provider:        raw.provider                    || 'gps',
-      encryptedCoords: raw.encryptedCoords             || '',
-      snapped:         raw.snapped === '1',
-      roadName:        raw.roadName                    || '',
-      timestamp:       parseInt(raw.timestamp)         || 0,
-      isActive:        raw.isActive === '1'
+      trackId:         loc.trackId,
+      lat:             loc.lat                         || 0,
+      lng:             loc.lng                         || 0,
+      speed:           loc.speed                       || 0,
+      accuracy:        loc.accuracy                    || 0,
+      heading:         loc.heading                     || 0,
+      altitude:        loc.altitude                    || 0,
+      altAccuracy:     loc.altAccuracy                 || 0,
+      speedAccuracy:   loc.speedAccuracy               || 0,
+      headingAccuracy: loc.headingAccuracy             || 0,
+      provider:        loc.provider                    || 'gps',
+      encryptedCoords: loc.encryptedCoords             || '',
+      snapped:         loc.snapped                     || false,
+      roadName:        loc.roadName                    || '',
+      timestamp:       new Date(loc.timestamp).getTime() || 0,
+      isActive:        loc.isActive                    || false
     };
   } catch { return null; }
 }
@@ -1221,11 +1195,11 @@ app.get('/api/location/:trackId', async (req, res) => {
     const IS_RECENT_MS = 10_000;
     const nowMs = Date.now();
 
-    // 1. Try Redis first (fast path)
+    // 1. Read from MongoDB (direct query)
     let location = await readLocation(trackId);
 
     if (!location) {
-      // 2. Fall back to MongoDB
+      // 2. Direct MongoDB query as fallback
       const dbLoc = await Location.findOne({ trackId }).lean();
       if (!dbLoc) return res.json({ trackId, isRecent: false, notFound: true });
       location = {
@@ -1271,11 +1245,11 @@ app.get('/api/locations/bulk', async (req, res) => {
     const nowMs    = Date.now();
     const IS_RECENT_MS = 10_000;
 
-    // Batch read from Redis with Promise.all
-    const redisResults = await Promise.all(trackIds.map(id => readLocation(id)));
+    // Batch read from MongoDB with Promise.all
+    const locationResults = await Promise.all(trackIds.map(id => readLocation(id)));
 
-    // For any cache miss, fall back to Mongo
-    const missingIds = trackIds.filter((id, i) => !redisResults[i]);
+    // For any read failure, fall back to direct Mongo query
+    const missingIds = trackIds.filter((id, i) => !locationResults[i]);
     const dbLocs = missingIds.length > 0
       ? await Location.find({ trackId: { $in: missingIds } }).lean()
       : [];
@@ -1283,7 +1257,7 @@ app.get('/api/locations/bulk', async (req, res) => {
     const dbMap = new Map(dbLocs.map(l => [l.trackId, l]));
 
     const locations = trackIds.map((id, i) => {
-      if (redisResults[i]) return redisResults[i];
+      if (locationResults[i]) return locationResults[i];
       const db = dbMap.get(id);
       if (!db) return null;
       return {
@@ -1333,43 +1307,33 @@ app.post('/api/location/batch', authenticateToken, async (req, res) => {
     if (trackId !== req.user.trackId) return res.status(403).json({ error: 'Access denied' });
     if (points.length > 20) return res.status(400).json({ error: 'Max 20 points per batch' });
 
-    // Write best point (lowest accuracy) to Redis for live location
+    // Write best point (lowest accuracy) to MongoDB for live location
     const best = points.reduce((a, b) => (b.accuracy || 999) < (a.accuracy || 999) ? b : a);
     const hasEncrypted = !!(best.encryptedCoords && best.encryptedCoords.length > 0);
 
     await writeLocation(trackId, { ...best, hasEncrypted });
 
-    // Push ALL non-encrypted points to Redis path (for better road snapping context)
+    // Push ALL non-encrypted points to MongoDB PathHistory
     const nonEncrypted = points.filter(p => !p.encryptedCoords || p.encryptedCoords.length === 0);
     if (nonEncrypted.length > 0) {
-      const pathPushes = nonEncrypted.map(p => JSON.stringify({
-        lat: p.lat || 0, lng: p.lng || 0,
-        speed: p.speed || 0, heading: p.heading || 0,
-        timestamp: p.timestamp || Date.now()
-      }));
-      redisData.rPush(pathKey(trackId), ...pathPushes)
-        .then(() => redisData.lTrim(pathKey(trackId), -MAX_PATH_PTS))
-        .then(() => redisData.expire(pathKey(trackId), TTL_PATH))
-        .catch(() => {});
+      PathHistory.findOneAndUpdate(
+        { trackId },
+        {
+          $push: {
+            points: {
+              $each: nonEncrypted.map(p => ({
+                lat: p.lat || 0, lng: p.lng || 0,
+                speed: p.speed || 0, heading: p.heading || 0,
+                timestamp: p.timestamp || Date.now()
+              })),
+              $slice: -MAX_PATH_PTS
+            }
+          },
+          $set: { lastUpdated: new Date() }
+        },
+        { upsert: true }
+      ).catch(() => {});
     }
-
-    // Background: write all points to Mongo path history
-    setImmediate(async () => {
-      const now = new Date();
-      const pathPoints = points.map(p => ({
-        lat: p.lat || 0, lng: p.lng || 0,
-        timestamp: new Date(p.timestamp || now),
-        speed: p.speed || 0, heading: p.heading || 0
-      })).filter(p => p.lat !== 0 || p.lng !== 0);
-
-      if (pathPoints.length > 0) {
-        PathHistory.findOneAndUpdate(
-          { trackId },
-          { $push: { points: { $each: pathPoints, $slice: -MAX_PATH_PTS } }, lastUpdated: now },
-          { upsert: true }
-        ).catch(() => {});
-      }
-    });
 
     res.json({ success: true, processed: points.length });
   } catch (err) {
@@ -1379,8 +1343,9 @@ app.post('/api/location/batch', authenticateToken, async (req, res) => {
 
 app.get('/api/cache/stats', async (req, res) => {
   try {
-    const info = await redisData.info('stats');
-    res.json({ redis: info, timestamp: new Date() });
+    // MongoDB stats instead of Redis
+    const stats = await mongoose.connection.db.stats();
+    res.json({ mongodb: stats, timestamp: new Date() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1389,28 +1354,35 @@ app.get('/api/cache/stats', async (req, res) => {
 app.get('/api/debug/location-source/:trackId', async (req, res) => {
   try {
     const { trackId } = req.params;
-    const redisLoc = await readLocation(trackId);
+    const loc = await readLocation(trackId);
     const mongoLoc = await Location.findOne({ trackId }).lean();
     const kalmanState = await getKalmanState(trackId);
 
+    if (!mongoLoc) return res.status(404).json({ error: 'Location not found' });
+
     res.json({
-      redis: redisLoc ? {
-        ageMs: Date.now() - redisLoc.timestamp,
-        lat: redisLoc.lat, lng: redisLoc.lng,
-        speed: redisLoc.speed, accuracy: redisLoc.accuracy,
-        snapped: redisLoc.snapped
+      trackId,
+      memory: loc ? {
+        ageMs: Date.now() - loc.timestamp,
+        lat: loc.lat, lng: loc.lng,
+        speed: loc.speed, accuracy: loc.accuracy,
+        snapped: loc.snapped
       } : null,
       mongodb: mongoLoc ? {
         ageMs: Date.now() - new Date(mongoLoc.timestamp).getTime(),
         lat: mongoLoc.lat, lng: mongoLoc.lng,
-        speed: mongoLoc.speed, accuracy: mongoLoc.accuracy
+        speed: mongoLoc.speed, accuracy: mongoLoc.accuracy,
+        snapped: mongoLoc.snapped
       } : null,
       kalman: kalmanState ? {
-        latEst: kalmanState.latEst, lngEst: kalmanState.lngEst,
-        ageMs: Date.now() - kalmanState.lastMs,
+        latEst: kalmanState.latEst,
+        lngEst: kalmanState.lngEst,
+        latVar: kalmanState.latVar,
+        lngVar: kalmanState.lngVar,
+        lastMs: kalmanState.lastMs,
         lastHeading: kalmanState.lastHeading
       } : null,
-      source: redisLoc ? 'redis' : (mongoLoc ? 'mongodb-fallback' : 'none')
+      source: 'mongodb'
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1442,21 +1414,11 @@ app.get('/api/path/:trackId', async (req, res) => {
     const { trackId } = req.params;
     const { hours = 2 } = req.query;
 
-    // Try Redis first
-    const raw = await redisData.lRange(pathKey(trackId), -MAX_PATH_PTS, -1);
-    if (raw && raw.length > 0) {
-      const cutoff = Date.now() - parseInt(hours) * 3_600_000;
-      const points = raw
-        .map(p => { try { return JSON.parse(p); } catch { return null; } })
-        .filter(p => p && p.timestamp > cutoff);
-      return res.json({ points });
-    }
-
-    // Fall back to Mongo
+    // Read from MongoDB PathHistory
     const pathHistory = await PathHistory.findOne({ trackId });
     if (!pathHistory) return res.json({ points: [] });
     const timeAgo      = new Date(Date.now() - parseInt(hours) * 60 * 60 * 1000);
-    const recentPoints = pathHistory.points.filter(p => p.timestamp > timeAgo);
+    const recentPoints = pathHistory.points.filter(p => new Date(p.timestamp) > timeAgo);
     res.json({ points: recentPoints });
   } catch (error) {
     console.error('Error fetching path history:', error);
@@ -1500,7 +1462,7 @@ app.post('/api/location/deactivate/:trackId', async (req, res) => {
     const { trackId } = req.params;
     const result = await Location.findOneAndUpdate({ trackId }, { isActive: false }, { new: true });
     if (!result) return res.status(404).json({ error: 'Track ID not found' });
-    locationEngine.cleanup(trackId);
+    // locationEngine.cleanup(trackId); // DISABLED - LocationEngine no longer used
     res.json({ success: true });
   } catch (error) {
     console.error('Error deactivating location:', error);
@@ -2214,7 +2176,7 @@ app.get('/api/sos/pending/:myTrackId', async (req, res) => {
 setInterval(async () => {
   try {
     const cutoff = new Date(Date.now() - 24 * 3_600_000);
-    // Kalman state is now in Redis with TTL, no manual cleanup needed
+    // Kalman state is now in-memory (loses state on server restart)
     const [dl, dp] = await Promise.all([
       Location.deleteMany({ timestamp: { $lt: cutoff } }),
       PathHistory.deleteMany({ lastUpdated: { $lt: cutoff } })
