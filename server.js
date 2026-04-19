@@ -345,6 +345,32 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date(), database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime() });
 });
 
+// Warm-up endpoint — responds immediately but pre-warms MongoDB in background
+app.get('/api/ping', (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+  // Warm MongoDB in background without blocking the response
+  setImmediate(() => {
+    User.findOne({}).lean().catch(() => {});
+    Location.findOne({}).lean().catch(() => {});
+  });
+});
+
+// External monitoring endpoint for UptimeRobot
+app.get('/api/warmup', (req, res) => {
+  // Respond instantly
+  res.json({ ok: true, ts: Date.now() });
+  // Pre-warm DB connections in background
+  setImmediate(async () => {
+    try {
+      await Promise.all([
+        User.findOne({}).lean(),
+        Location.findOne({}).lean(),
+        redisData.ping()
+      ]);
+    } catch (_) {}
+  });
+});
+
 // ==================== AUTHENTICATION MIDDLEWARE ====================
 
 async function authenticateToken(req, res, next) {
@@ -1963,14 +1989,12 @@ setInterval(async () => {
 
 // ==================== KEEP-ALIVE (Render cold start prevention) ====================
 
-// Ping self every 14 minutes to prevent Render free tier from spinning down
-// Render sleeps after 15 min of inactivity; this keeps it warm
+// Ping self every 4 minutes to prevent Render free tier from spinning down
+// Render sleeps after 15 min of inactivity; ping every 4min is safe margin
 setInterval(() => {
   const http = require('http');
-  http.get(`http://localhost:${PORT}/api/health`, (res) => {
-    console.log(' Keep-alive ping:', res.statusCode);
-  }).on('error', () => {});
-}, 14 * 60 * 1000);
+  http.get(`http://localhost:${PORT}/api/warmup`, () => {}).on('error', () => {});
+}, 4 * 60 * 1000);
 
 // ==================== ERROR HANDLING ====================
 
