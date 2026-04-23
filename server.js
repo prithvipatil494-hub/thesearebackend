@@ -40,6 +40,9 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// Serve static files from public directory
+app.use(express.static('public'));
+
 // ─── Cloudinary Configuration ───────────────────────────────────────────────────
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -1164,6 +1167,71 @@ app.post('/api/location/update', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Error in location update:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/location/:trackId - Test endpoint for GPS simulation (no auth required)
+app.post('/api/location/:trackId', async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    const { lat, lng, speed, accuracy, heading, altitude, timestamp } = req.body;
+
+    if (!trackId) return res.status(400).json({ error: 'Track ID required' });
+    if (lat === undefined || lng === undefined) return res.status(400).json({ error: 'lat and lng required' });
+
+    // Update or create location
+    await Location.findOneAndUpdate(
+      { trackId },
+      {
+        lat: lat || 0,
+        lng: lng || 0,
+        speed: speed || 0,
+        accuracy: accuracy || 0,
+        heading: heading || 0,
+        altitude: altitude || 0,
+        timestamp: timestamp ? new Date(timestamp) : new Date(),
+        isActive: true
+      },
+      { upsert: true, new: true }
+    );
+
+    // Add to path history
+    await PathHistory.findOneAndUpdate(
+      { trackId },
+      {
+        $push: {
+          points: {
+            $each: [{
+              lat: lat || 0,
+              lng: lng || 0,
+              timestamp: timestamp ? new Date(timestamp) : new Date(),
+              speed: speed || 0,
+              heading: heading || 0
+            }],
+            $slice: -MAX_PATH_PTS
+          }
+        },
+        lastUpdated: new Date()
+      },
+      { upsert: true }
+    );
+
+    // Emit via Socket.IO for real-time updates
+    io.emit(`location:${trackId}`, {
+      trackId,
+      lat: lat || 0,
+      lng: lng || 0,
+      speed: speed || 0,
+      accuracy: accuracy || 0,
+      heading: heading || 0,
+      timestamp: new Date()
+    });
+
+    console.log(`📍 [TEST] Location updated for ${trackId}: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
+    res.json({ success: true, trackId, lat, lng });
+  } catch (error) {
+    console.error('Error in test location update:', error);
     res.status(500).json({ error: error.message });
   }
 });
