@@ -2259,7 +2259,7 @@ setInterval(async () => {
 // ==================== KEEP-ALIVE (Render cold start prevention) ====================
 
 // Ping self every 4 minutes to prevent Render free tier from spinning down
-// Render sleeps after 15 min of inactivity; ping every 4min is safe margin
+// Render sleeps after 15 min of inactivity; ping every 4min is safe margi
 setInterval(() => {
   const http = require('http');
   http.get(`http://localhost:${PORT}/api/warmup`, () => {}).on('error', () => {});
